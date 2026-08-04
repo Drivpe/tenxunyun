@@ -7,6 +7,13 @@ from concurrent.futures import ThreadPoolExecutor
 # 重要：请先运行get_cookies.py获取登录后的cookies，并确保cookies.json文件存在且格式正确
 session = requests.Session()
 
+ACTIVITY_ID = 164461404341040
+SERVER_ACT_ID = 1897632168296710
+SERVER_TYPE = "bundle_budget_mc_lg4_01"
+SERVER_IMAGE_ID = "lhbp-1l4ptuvm"  # Ubuntu 24.04 LTS (PURE_OS)
+REFERER_URL = "https://cloud.tencent.com/act/pro/featured-202607?fromSource=gwzcw.12786259.12786259.12786259&utm_medium=cpc&utm_id=gwzcw.12786259.12786259.12786259&msclkid=f99b232f8cf718f65fb449478f0cb94b#MS"
+REGION_NAMES = {1: "广州", 4: "上海", 8: "北京"}
+
 # 加载Cookie（确保cookies.json文件格式正确）
 with open("cookies.json", "r", encoding="utf-8") as f:
     cookies = json.load(f)
@@ -20,11 +27,26 @@ with open("cookies.json", "r", encoding="utf-8") as f:
         )
 
 
+def get_cookie_value(name):
+    values = [cookie.get("value", "") for cookie in cookies if cookie.get("name") == name and cookie.get("value")]
+    return values[-1] if values else ""
+
+
+def get_csrf_token():
+    skey = get_cookie_value("skey") or get_cookie_value("p_skey")
+    if skey:
+        token = 5381
+        for char in skey:
+            token += (token << 5) + ord(char)
+        return str(token & 0x7fffffff)
+    return get_cookie_value("qcmainCSRFToken")
+
+
 check_data = {
-    "activity_id": 162634773874417,
+    "activity_id": ACTIVITY_ID,
     "goods": [
         {
-            "act_id": 1784747698901873,
+            "act_id": SERVER_ACT_ID,
             "region_id": [1,4,8]
         }
     ],
@@ -33,11 +55,16 @@ check_data = {
 
 
 headers = {
-    "x-csrf-token": str(1098793468),  # 需从浏览器实时获取
+    "x-csrf-token": get_csrf_token(),
+    "X-CSRF-TOKEN": get_csrf_token(),
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-    "referer": "https://cloud.tencent.com/act/pro/featured-202607?fromSource=gwzcw.10216579.10216579.10216579&utm_medium=cpc&utm_id=gwzcw.10216579.10216579.10216579&msclkid=9d471e943d2d142808a4771f328779e6&page=warmup-202606&s_source=https%3A%2F%2Fcloud.tencent.com%2Fact%2Fpro%2Fdouble12-2025"
+    "referer": REFERER_URL,
+    "origin": "https://cloud.tencent.com"
 }
+headers["x-csrf-token"] = get_csrf_token()
+headers["X-CSRF-TOKEN"] = headers["x-csrf-token"]
+headers["referer"] = REFERER_URL
 
 # =================== 检查是否可抢购 =================== #
 
@@ -71,13 +98,7 @@ def check_available():
 
     # 安全获取地域库存（修复：避免KeyError）
     quota = goods_data.get("quota", {})
-    # 优先级：1（华北）→4（华东）→8（华南）
-    region_map = {
-        1: "华北",
-        4: "华东",
-        8: "华南",
-    }
-    for region_id, region_name in region_map.items():
+    for region_id, region_name in REGION_NAMES.items():
         # 逐层get，避免字段缺失报错
         available = quota.get(str(region_id), {})\
                         .get("bundle_budget_mc_lg4_01", {})\
@@ -112,12 +133,12 @@ def buy_now(region_id):
     :param region_id: 有货的地域ID
     """
     do_data = {
-        "activity_id": 162634773874417,
+        "activity_id": ACTIVITY_ID,
         "agent_channel": {
             "fromChannel": "",
             "fromSales": "",
             "isAgentClient": False,
-            "fromUrl": "https://cloud.tencent.com/act/pro/featured-202607?fromSource=gwzcw.10216579.10216579.10216579&utm_medium=cpc&utm_id=gwzcw.10216579.10216579.10216579&msclkid=9d471e943d2d142808a4771f328779e6&page=warmup-202606&s_source=https%3A%2F%2Fcloud.tencent.com%2Fact%2Fpro%2Fdouble12-2025"
+            "fromUrl": REFERER_URL
         },
         
         "business": {
@@ -126,25 +147,26 @@ def buy_now(region_id):
         },
         "goods": [
             {
-                "act_id": 1897632168296710,
-                "type": "bundle_budget_mc_lg4_01",
+                "act_id": SERVER_ACT_ID,
+                "type": SERVER_TYPE,
                 "goods_param": {
                     "BlueprintId": "LINUX_UNIX",
                     "area": 1,
                     "ddocUnionConnect": 0,
                     "goodsNum": 1,
-                    "imageId": "lhbp-eqora508",
+                    "imageId": SERVER_IMAGE_ID,
                     "scenario": "0",
                     "timeSpanUnit": "12m",
                     "zone": "",
                     "regionId": region_id,
-                    "type": "bundle_budget_mc_lg4_01"
+                    "type": SERVER_TYPE
                 }
             }
         ],
         
         "preview": 0
     }
+    do_data["agent_channel"]["fromUrl"] = REFERER_URL
     try:
         # 修复：传do_data而非pay_data
         resp = session.post(
@@ -161,7 +183,7 @@ def buy_now(region_id):
     
 def get_server_time():
     """获取服务器时间，校准本地时间"""
-    url = "https://cloud.tencent.com/act/pro/double12-2025"
+    url = "https://cloud.tencent.com/act/pro/featured-202607"
     response = requests.head(url)
     server_time = response.headers.get("Date")
 
@@ -192,18 +214,46 @@ def buy_now_concurrent(region_ids):
     return None
 
 # =================== 主程序 =================== #
+def buy_now_with_retry(
+    region_ids,
+    duration_seconds=60,
+    interval_seconds=0.5,
+    buy_func=buy_now_concurrent,
+    time_func=time.monotonic,
+    sleep_func=time.sleep,
+):
+    deadline = time_func() + duration_seconds
+    attempt = 0
+    last_result = None
+
+    while True:
+        attempt += 1
+        print(f"retry attempt {attempt}")
+        last_result = buy_func(region_ids)
+
+        if isinstance(last_result, dict) and last_result.get("code") == 0:
+            return last_result
+
+        remaining_seconds = deadline - time_func()
+        if remaining_seconds <= 0:
+            print(f"retry window ended after {duration_seconds} seconds")
+            return last_result
+
+        sleep_func(min(interval_seconds, remaining_seconds))
+
+
 if __name__ == "__main__":
     print("🚀 启动腾讯云抢购脚本...")
-    SECKILL_TIME_STR = "2026-02-12 15:00:00" # 秒杀开始时间（北京时间）可以更改为10:00:00,此处需要更改为实际的秒杀时间
+    SECKILL_TIME_STR = "2026-08-04 15:00:00" # 秒杀开始时间（北京时间）可以更改为10:00:00,此处需要更改为实际的秒杀时间
     SECKILL_TIMESTAMP = int(time.mktime(time.strptime(SECKILL_TIME_STR, "%Y-%m-%d %H:%M:%S"))) * 1000
     region_ids = [1, 4, 8]
     
     
     while True:
         current_time = get_server_time()
-        if current_time >= SECKILL_TIMESTAMP:
+        if current_time >= SECKILL_TIMESTAMP - 3_000:
             print("秒杀开始！")
-            buy_now_concurrent(region_ids)
+            buy_now_with_retry(region_ids, duration_seconds=60, interval_seconds=0.5)
             break
         else:
             print(f"⏳ 当前时间未到达秒杀时间，当前服务器时间: {current_time}, 秒杀时间: {SECKILL_TIMESTAMP}")
