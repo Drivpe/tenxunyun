@@ -147,7 +147,163 @@ class DeadCodeTest(unittest.TestCase):
     def test_prepare_do_dead_block_removed(self):
         import inspect
         source = inspect.getsource(snap_up_server)
-        self.assertNotIn("prepare-do", source)
+        # prepare-do 现在必须是可执行代码，而不是 return 之后的死块
+        self.assertTrue(hasattr(snap_up_server, "prepare_eligibility_check"))
+        self.assertIn("prepare-do", source)
+
+
+class ResultClassificationTest(unittest.TestCase):
+    """现场事故：限流与资格硬错误都被当作普通失败高频重试"""
+
+    def test_success(self):
+        self.assertEqual(snap_up_server.classify_result({"code": 0}), "success")
+
+    def test_rate_limit(self):
+        self.assertEqual(
+            snap_up_server.classify_result({"code": 408, "msg": "系统访问频率过快，请稍后再试"}),
+            "rate_limited",
+        )
+
+    def test_fatal_eligibility_codes(self):
+        # 1100106 未激活 / 1100507 获取用户信息失败，重试无效
+        self.assertEqual(snap_up_server.classify_result({"code": 1100106}), "fatal")
+        self.assertEqual(snap_up_server.classify_result({"code": 1100507}), "fatal")
+
+    def test_seckill_not_started_is_retryable(self):
+        self.assertEqual(snap_up_server.classify_result({"code": 1101001}), "retryable")
+
+    def test_none_and_unknown_are_retryable(self):
+        self.assertEqual(snap_up_server.classify_result(None), "retryable")
+        self.assertEqual(snap_up_server.classify_result({"code": 9999}), "retryable")
+
+
+class FatalStopsRetryTest(unittest.TestCase):
+    def test_stops_immediately_on_fatal(self):
+        calls = []
+        clock = [0.0]
+
+        def fake_buy(region_ids):
+            calls.append(1)
+            return {"code": 1100507, "msg": "获取用户信息失败"}
+
+        result = snap_up_server.buy_now_with_retry(
+            [1, 4, 8],
+            duration_seconds=60,
+            interval_seconds=0.5,
+            buy_func=fake_buy,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: clock.__setitem__(0, clock[0] + sec),
+        )
+
+        # 修复前会打满 60 秒窗口（约 80+ 轮），现在必须只调用一次
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["code"], 1100507)
+        self.assertEqual(clock[0], 0.0)
+
+
+class RateLimitBackoffTest(unittest.TestCase):
+    def test_backoff_grows_instead_of_fixed_interval(self):
+        slept = []
+        clock = [0.0]
+
+        def fake_buy(region_ids):
+            return {"code": 408, "msg": "系统访问频率过快"}
+
+        snap_up_server.buy_now_with_retry(
+            [1, 4, 8],
+            duration_seconds=60,
+            interval_seconds=0.5,
+            buy_func=fake_buy,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: (slept.append(sec), clock.__setitem__(0, clock[0] + sec)),
+            max_backoff_seconds=8.0,
+        )
+
+        # 修复前恒为 0.5 秒；现在应逐轮拉大并封顶
+        self.assertGreater(len(slept), 2)
+        self.assertEqual(slept[0], 1.0)
+        self.assertGreater(slept[1], slept[0])
+        self.assertLessEqual(max(slept), 8.0)
+        self.assertGreater(slept[1], 0.5, "限流时不得沿用 0.5 秒高频节奏")
+
+    def test_returns_to_base_interval_after_retryable(self):
+        slept = []
+        clock = [0.0]
+        codes = [{"code": 408}, {"code": 1101001}, {"code": 408}, {"code": 0}]
+
+        def fake_buy(region_ids):
+            return codes.pop(0)
+
+        result = snap_up_server.buy_now_with_retry(
+            [1, 4, 8],
+            duration_seconds=60,
+            interval_seconds=0.5,
+            buy_func=fake_buy,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: (slept.append(sec), clock.__setitem__(0, clock[0] + sec)),
+        )
+
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(slept[0], 1.0)      # 408 -> 退避
+        self.assertEqual(slept[1], 0.5)      # 尚未开始 -> 回到基准节奏
+
+
+class PrepareEligibilityTest(unittest.TestCase):
+    def setUp(self):
+        self._original = snap_up_server.session
+        snap_up_server.session = None  # 强制走 except 分支前先替换
+
+    def tearDown(self):
+        snap_up_server.session = self._original
+
+    def test_blocked_when_act_condition_unmet(self):
+        class Resp:
+            def json(self):
+                return {
+                    "code": 1100106,
+                    "msg": "抱歉，当前活动仅针对已激活账号开放，欢迎了解其他活动。",
+                    "data": {"detail": {"act_condition": {
+                        "activated": 0, "real_name": 0, "registered": 1, "available": 0}}},
+                }
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        self.assertEqual(snap_up_server.prepare_eligibility_check(), "blocked")
+
+    def test_passed_on_code_zero(self):
+        class Resp:
+            def json(self):
+                return {"code": 0, "msg": "ok"}
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        self.assertEqual(snap_up_server.prepare_eligibility_check(), "passed")
+
+    def test_unknown_for_other_codes(self):
+        class Resp:
+            def json(self):
+                return {"code": 1101001, "msg": "抱歉，秒杀尚未开始"}
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        self.assertEqual(snap_up_server.prepare_eligibility_check(), "unknown")
+
+    def test_unknown_on_exception(self):
+        class FakeSession:
+            def post(self, *a, **k):
+                raise RuntimeError("timeout")
+
+        snap_up_server.session = FakeSession()
+        self.assertEqual(snap_up_server.prepare_eligibility_check(), "unknown")
 
 
 class BuyNowConcurrentTest(unittest.TestCase):

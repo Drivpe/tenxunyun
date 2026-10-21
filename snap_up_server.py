@@ -1,6 +1,7 @@
 import requests
 import json
 import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -295,6 +296,71 @@ def buy_now_concurrent(region_ids):
     return None
 
 # =================== 主程序 =================== #
+
+# 明确不可重试的业务错误：账号资格不满足，重试毫无意义
+# 1100106 = 活动仅对已激活账号开放；1100507 = 获取用户信息失败
+FATAL_CODES = {1100106, 1100507}
+# 限流：继续高频轰炸只会延长封禁，需要退避
+RATE_LIMIT_CODES = {408}
+
+
+def classify_result(result):
+    """把接口返回归类：success / rate_limited / fatal / retryable"""
+    if isinstance(result, dict):
+        code = result.get("code")
+        if code == 0:
+            return "success"
+        if code in RATE_LIMIT_CODES:
+            return "rate_limited"
+        if code in FATAL_CODES:
+            return "fatal"
+    return "retryable"
+
+
+def prepare_eligibility_check():
+    """
+    调用 prepare-do 预检账号资格，返回 'passed' / 'blocked' / 'unknown'。
+
+    为什么必须单独预检：check-available 的 user_available=1 只表示商品维度
+    可用，并不校验账号激活状态；prepare-do 返回的 act_condition 才是账号
+    真实状态。实测存在 user_available=1 却被 do-goods 以 1100507 拒绝的账号，
+    没有这一步，只会在开抢瞬间才发现抢不到。
+
+    'unknown' 表示接口给出其它原因（例如秒杀尚未开始），不能据此判定资格失败。
+    """
+    try:
+        resp = session.post(
+            "https://act-api.cloud.tencent.com/dianshi/prepare-do",
+            json={"activity_id": ACTIVITY_ID, "act_id": SERVER_ACT_ID},
+            headers=headers,
+            timeout=10,
+        )
+        result = resp.json()
+    except Exception as e:
+        print(f"⚠️ 资格预检接口调用失败，跳过预检：{e}")
+        return "unknown"
+
+    code = result.get("code")
+    if code == 0:
+        print("✅ 资格预检通过")
+        return "passed"
+
+    if code in FATAL_CODES:
+        detail = (result.get("data") or {}).get("detail") or {}
+        act_condition = detail.get("act_condition") or {}
+        missing = [key for key, value in act_condition.items() if value == 0 and key != "available"]
+        print(f"⛔ 资格预检未通过：code={code} msg={result.get('msg')}")
+        if missing:
+            print(f"   账号未满足的条件：{', '.join(missing)}")
+        if "activated" in missing:
+            print("   该活动要求账号已完成开通（激活），请先在腾讯云控制台完成账号激活，")
+            print("   否则本场及后续场次都会被 do-goods 直接拒绝。")
+        return "blocked"
+
+    print(f"ℹ️ 资格预检返回其它状态：code={code} msg={result.get('msg')}")
+    return "unknown"
+
+
 def buy_now_with_retry(
     region_ids,
     duration_seconds=60,
@@ -302,17 +368,25 @@ def buy_now_with_retry(
     buy_func=buy_now_concurrent,
     time_func=time.monotonic,
     sleep_func=time.sleep,
+    max_backoff_seconds=8.0,
 ):
     deadline = time_func() + duration_seconds
     attempt = 0
     last_result = None
+    backoff = interval_seconds
 
     while True:
         attempt += 1
         print(f"retry attempt {attempt}")
         last_result = buy_func(region_ids)
+        kind = classify_result(last_result)
 
-        if isinstance(last_result, dict) and last_result.get("code") == 0:
+        if kind == "success":
+            return last_result
+
+        if kind == "fatal":
+            # 资格类硬错误重试不会改变结果，立刻停手，避免继续刷接口加重风控
+            print("⛔ 账号资格校验未通过，停止重试")
             return last_result
 
         remaining_seconds = deadline - time_func()
@@ -320,7 +394,18 @@ def buy_now_with_retry(
             print(f"retry window ended after {duration_seconds} seconds")
             return last_result
 
-        sleep_func(min(interval_seconds, remaining_seconds))
+        if kind == "rate_limited":
+            # 408 限流：指数退避，给网关冷却时间
+            wait_seconds = min(max(backoff * 2, 1.0), max_backoff_seconds)
+            backoff = wait_seconds
+            print(f"⚠️ 触发限流(408)，退避 {wait_seconds:.1f} 秒")
+        else:
+            # 正常可重试（如秒杀尚未开始）：恢复基准节奏
+            backoff = interval_seconds
+            wait_seconds = interval_seconds
+
+        sleep_func(min(wait_seconds, remaining_seconds))
+
 
 
 def select_seckill_timestamp(manual_time_str="", now_ms=None):
@@ -372,6 +457,33 @@ if __name__ == "__main__":
     refresh_csrf_headers()
 
     region_ids = [1, 4, 8]
+    check_only = "--check" in sys.argv
+
+    # 资格预检必须在等待之前：抢不到库存和没资格抢，是两件事
+    eligibility = prepare_eligibility_check()
+
+    if check_only:
+        # 诊断模式不做硬阻断：继续输出库存与场次，一条命令看全状态，
+        # 资格被拦时仍以退出码 2 给出红色信号
+        check_available()
+        sessions = fetch_seckill_sessions()
+        now_ms = get_server_time()
+        target = pick_next_session(sessions, now_ms) if now_ms else None
+        if target:
+            minutes = (target["start_ms"] - now_ms) / 1000 / 60
+            state = f"已开始 {abs(minutes):.0f} 分钟" if minutes <= 0 else f"距开抢 {minutes:.0f} 分钟"
+            print(f"📅 场次 {target['start_text']}（北京时间），{state}，"
+                  f"结束于 {datetime.fromtimestamp(target['end_ms'] / 1000, BEIJING_TZ):%H:%M}")
+        else:
+            print("❌ 当前没有未结束的场次")
+        print("✅ 预检完成（未调用任何下单接口）")
+        raise SystemExit(2 if eligibility == "blocked" else 0)
+
+    if eligibility == "blocked":
+        print("❌ 已停止：该账号不满足活动资格，重试与换场次都无法绕过。")
+        raise SystemExit(2)
+    if eligibility == "unknown":
+        print("ℹ️ 未能确认可抢，将继续按原计划等待开抢。")
 
     seckill_timestamp = select_seckill_timestamp(SECKILL_TIME_STR)
     if seckill_timestamp is None:
