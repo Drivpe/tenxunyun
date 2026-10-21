@@ -23,11 +23,14 @@
 | 活动 ID | `164461404341040` | `ACTIVITY_ID` |
 | 商品活动 ID | `1897632168296710` | `SERVER_ACT_ID` |
 | 商品类型 | `bundle_budget_mc_lg4_01` | 4 核 4 GB 套餐标识 |
-| 系统镜像 | `lhbp-1l4ptuvm` | Ubuntu 24.04 LTS 纯净系统 |
+| 系统镜像 | `lhbp-eqora508` | 活动页当前默认镜像（`BlueprintId=LINUX_UNIX`，Linux 纯净系统） |
 | 购买时长 | `12m` | 1 年 |
 | 地域 | `1, 4, 8` | 广州、上海、北京 |
 | 重试窗口 | 60 秒 | 开始抢购后持续时间 |
 | 重试间隔 | 0.5 秒 | 每轮完成后的额外等待时间 |
+| 提前触发 | 3000 毫秒 | 开抢前 3 秒开始请求 |
+
+活动页只暴露 `BlueprintId=LINUX_UNIX`，不标注具体发行版，因此脚本不再声明镜像是 Ubuntu。需要特定系统时请在活动页确认。
 
 地域 ID 来自当前活动页面：
 
@@ -45,8 +48,8 @@
 2. 用户扫码并在手机端确认登录。
 3. 登录完成后，Playwright 把 Cookie 保存到本地 `cookies.json`。
 4. `snap_up_server.py` 加载 Cookie，并从 `skey` 或 `p_skey` 自动计算 CSRF Token。
-5. 脚本读取腾讯云页面响应头中的 HTTP `Date`，用于等待官方秒杀时间。
-6. 到达提前触发时间后，脚本并发调用三个地域的真实购买接口。
+5. 脚本抓取活动页，解析目标商品尚未结束的秒杀场次，得到开抢的绝对毫秒时间戳。
+6. 脚本读取腾讯云页面响应头中的 HTTP `Date` 对时，到达提前触发时间后并发调用三个地域的真实购买接口。
 7. 请求失败时继续重试，成功或重试窗口结束后退出。
 
 主程序当前不会先等待库存查询结果，而是到点后直接调用购买接口。`check_available()` 主要用于人工诊断库存和账号资格。
@@ -156,21 +159,23 @@ Login succeeded. Saved 31 cookies to cookies.json.
 ACTIVITY_ID = 164461404341040
 SERVER_ACT_ID = 1897632168296710
 SERVER_TYPE = "bundle_budget_mc_lg4_01"
-SERVER_IMAGE_ID = "lhbp-1l4ptuvm"  # Ubuntu 24.04 LTS
+SERVER_IMAGE_ID = "lhbp-eqora508"
 REGION_NAMES = {1: "广州", 4: "上海", 8: "北京"}
 ```
 
-然后修改主程序中的官方秒杀时间：
+秒杀时间默认自动获取，不需要手改。脚本会抓取活动页，解析目标商品尚未结束的场次：
 
 ```python
-SECKILL_TIME_STR = "2026-08-04 15:00:00"
+SECKILL_TIME_STR = ""  # 留空 = 自动解析场次
 ```
 
-日期和时间必须改成当次活动的北京时间，格式为：
+只有活动改版导致解析失败、或你明确要抢某一场时，才填北京时间强制指定：
 
-```text
-年-月-日 时:分:秒
+```python
+SECKILL_TIME_STR = "2026-10-22 10:00:00"
 ```
+
+格式为 `年-月-日 时:分:秒`，按北京时间填写，脚本内部换算为绝对时间戳，与本机时区无关。
 
 ### 3. 启动抢购脚本
 
@@ -207,7 +212,8 @@ Windows 文件关联不完整时，这种方式可能立即返回且不显示任
 当前代码：
 
 ```python
-if current_time >= SECKILL_TIMESTAMP - 3_000:
+EARLY_TRIGGER_MS = 3_000
+if current_time >= seckill_timestamp - EARLY_TRIGGER_MS:
 ```
 
 `3_000` 表示提前 3,000 毫秒，也就是提前 3 秒开始调用购买接口。例如官方时间为 `15:00:00`，脚本会从约 `14:59:57` 开始尝试。
@@ -215,10 +221,12 @@ if current_time >= SECKILL_TIMESTAMP - 3_000:
 如果希望提前 10 秒，可改为：
 
 ```python
-if current_time >= SECKILL_TIMESTAMP - 10_000:
+EARLY_TRIGGER_MS = 10_000
 ```
 
 提前请求时出现“秒杀尚未开始”是正常现象。不要把提前量设置得过大，以免产生大量无效请求或触发限流。
+
+等待期间脚本按剩余时间自适应轮询对时请求：距开抢超过 60 秒时每 10 秒一次，进入最后 60 秒改为每 1 秒一次。取不到服务器时间时会退避重试而不是崩溃。
 
 ### 重试窗口和间隔
 
@@ -258,10 +266,10 @@ region_ids = [4]
 当前镜像：
 
 ```python
-SERVER_IMAGE_ID = "lhbp-1l4ptuvm"
+SERVER_IMAGE_ID = "lhbp-eqora508"
 ```
 
-该 ID 对应 Ubuntu 24.04 LTS 64 位纯净系统镜像。镜像 ID 可能随活动或商品变化，不能只根据注释长期使用；活动更新后应重新核对页面参数。
+该 ID 取自活动页 `defaultGoodsParam.imageId`，页面仅给出 `BlueprintId=LINUX_UNIX`（Linux 纯净系统），未标注具体发行版。镜像 ID 会随活动或商品变化，不能长期沿用；活动更新后应重新核对页面参数。
 
 ## 输出与结果判断
 
@@ -330,6 +338,41 @@ python -m playwright install chromium
 python .\get_cookies.py
 ```
 
+### `未能从活动页解析到秒杀场次`
+
+自动场次解析依赖活动页的 JSON 内联数据。腾讯云改版页面结构后会失效，此时手动指定时间：
+
+```python
+SECKILL_TIME_STR = "2026-10-22 10:00:00"
+```
+
+判断是否为改版：打开活动页，搜索 `activity_id`，若场次块中不再同时出现 `start_date`、`start_time`、`startTime`，即为字段变更，需要更新 `parse_seckill_sessions()` 的正则。
+
+### Linux 上 `python3 -m venv` 失败
+
+提示 `ensurepip is not available` 时，安装对应发行版包：
+
+```bash
+sudo apt install python3-venv
+```
+
+若发行版暂无该包，可先建无 pip 的虚拟环境再引导：
+
+```bash
+python3 -m venv --without-pip .venv
+curl -sSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+./.venv/bin/python /tmp/get-pip.py
+./.venv/bin/python -m pip install -r requirements.txt
+```
+
+### Playwright 与已下载浏览器版本不匹配
+
+`python -m playwright install chromium` 只安装当前 Python 包版本对应的构建。若之前用 Node 版 Playwright 装过浏览器，缓存目录里的版本号可能不同，直接补装即可：
+
+```bash
+python -m playwright install chromium
+```
+
 ### 扫码后浏览器没有自动关闭
 
 - 确认手机端已经点击授权。
@@ -369,7 +412,7 @@ python -m unittest test_retry_window.py
 python -m py_compile get_cookies.py snap_up_server.py
 ```
 
-测试不会调用真实购买接口。
+测试覆盖重试窗口、地域映射、场次解析、场次选择、CSRF 推导和接口空响应，共 16 个用例，全部离线运行，不会调用真实购买接口。
 
 ## 项目结构
 
@@ -386,8 +429,8 @@ tenxunyun/
 ```
 
 - `get_cookies.py`：打开浏览器登录并保存 Cookie。
-- `snap_up_server.py`：加载会话、计算 CSRF、校准时间并调用购买接口。
-- `test_retry_window.py`：验证重试窗口和地域映射。
+- `snap_up_server.py`：加载会话、计算 CSRF、解析场次、校准时间并调用购买接口。
+- `test_retry_window.py`：验证重试窗口、地域映射、场次解析与 CSRF。
 - `requirements.txt`：Python 依赖列表。
 
 ## 免责声明
