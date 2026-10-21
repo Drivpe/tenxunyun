@@ -1,7 +1,8 @@
 import requests
 import json
-import time  
-from datetime import datetime, timedelta
+import re
+import time
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 # 重要：请先运行get_cookies.py获取登录后的cookies，并确保cookies.json文件存在且格式正确
@@ -10,13 +11,36 @@ session = requests.Session()
 ACTIVITY_ID = 164461404341040
 SERVER_ACT_ID = 1897632168296710
 SERVER_TYPE = "bundle_budget_mc_lg4_01"
-SERVER_IMAGE_ID = "lhbp-1l4ptuvm"  # Ubuntu 24.04 LTS (PURE_OS)
+# 镜像 ID 随活动刷新，以活动页 defaultGoodsParam.imageId 为准；
+# 页面只给出 BlueprintId=LINUX_UNIX（Linux 纯净系统），未标注具体发行版，故不断言 Ubuntu。
+SERVER_IMAGE_ID = "lhbp-eqora508"
 REFERER_URL = "https://cloud.tencent.com/act/pro/featured-202607?fromSource=gwzcw.12786259.12786259.12786259&utm_medium=cpc&utm_id=gwzcw.12786259.12786259.12786259&msclkid=f99b232f8cf718f65fb449478f0cb94b#MS"
+ACTIVITY_PAGE_URL = "https://cloud.tencent.com/act/pro/featured-202607"
 REGION_NAMES = {1: "广州", 4: "上海", 8: "北京"}
+BEIJING_TZ = timezone(timedelta(hours=8))
 
-# 加载Cookie（确保cookies.json文件格式正确）
-with open("cookies.json", "r", encoding="utf-8") as f:
-    cookies = json.load(f)
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+
+# Cookie 改为可延迟加载：文件缺失时仍可 import（单元测试、场次解析都不依赖登录态）
+def load_cookies(path="cookies.json"):
+    """读取 cookies.json；不存在时返回空列表并提示，不阻断导入"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+cookies = load_cookies()
+
+
+def install_cookies():
+    """把 cookies.json 灌入 session，返回是否成功"""
+    global cookies
+    cookies = load_cookies()
+    if not cookies:
+        return False
+    session.cookies.clear()
     for cookie in cookies:
         # 兼容Cookie字段缺失的情况
         session.cookies.set(
@@ -25,6 +49,7 @@ with open("cookies.json", "r", encoding="utf-8") as f:
             domain=cookie.get('domain', ''),
             path=cookie.get('path', '/')  # 默认路径为/
         )
+    return True
 
 
 def get_cookie_value(name):
@@ -58,13 +83,18 @@ headers = {
     "x-csrf-token": get_csrf_token(),
     "X-CSRF-TOKEN": get_csrf_token(),
     "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+    "User-Agent": USER_AGENT,
     "referer": REFERER_URL,
     "origin": "https://cloud.tencent.com"
 }
-headers["x-csrf-token"] = get_csrf_token()
-headers["X-CSRF-TOKEN"] = headers["x-csrf-token"]
-headers["referer"] = REFERER_URL
+
+
+def refresh_csrf_headers():
+    """登录态变化后重算 CSRF，避免沿用失效 Token"""
+    token = get_csrf_token()
+    headers["x-csrf-token"] = token
+    headers["X-CSRF-TOKEN"] = token
+    return token
 
 # =================== 检查是否可抢购 =================== #
 
@@ -101,7 +131,7 @@ def check_available():
     for region_id, region_name in REGION_NAMES.items():
         # 逐层get，避免字段缺失报错
         available = quota.get(str(region_id), {})\
-                        .get("bundle_budget_mc_lg4_01", {})\
+                        .get(SERVER_TYPE, {})\
                         .get("available", 0)
         if available > 0:
             print(f"✅ 检测到{region_name}（region_id={region_id}）有库存！")
@@ -111,20 +141,6 @@ def check_available():
     print("❌ 所有目标地域均无库存")
     return None
 
-
-    """调用prepare-do接口（抢购准备）"""
-    try:
-        resp = session.post(
-            "https://act-api.cloud.tencent.com/dianshi/prepare-do",
-            json=pay_data,
-            headers=headers,
-            timeout=10
-        )
-        print(f"📌 抢购准备接口返回：{resp.text}")
-        return resp.json()
-    except Exception as e:
-        print(f"❌ 抢购准备接口调用失败：{str(e)}")
-        return None
 
 # =================== 立即购买（核心下单） =================== #
 def buy_now(region_id):
@@ -182,35 +198,100 @@ def buy_now(region_id):
         return None
     
 def get_server_time():
-    """获取服务器时间，校准本地时间"""
-    url = "https://cloud.tencent.com/act/pro/featured-202607"
-    response = requests.head(url)
+    """获取服务器时间（绝对毫秒时间戳，与时区无关）"""
+    response = requests.head(ACTIVITY_PAGE_URL, timeout=10)
     server_time = response.headers.get("Date")
 
-    if server_time:
-        dt = datetime.strptime(server_time, "%a, %d %b %Y %H:%M:%S GMT")
-        beijing_time = dt + timedelta(hours=8)
-        timestamp_ms = int(beijing_time.timestamp() * 1000)
-        print(f"服务器时间(GMT): {dt}")
-        print(f"北京时间: {beijing_time}")
-        print(f"时间戳(毫秒): {timestamp_ms}")
-        return timestamp_ms
-    else:
+    if not server_time:
         print("未获取到服务器时间")
         return None
+
+    # HTTP Date 固定为 GMT，必须显式标注时区，否则跨时区机器会算错 8 小时
+    dt = datetime.strptime(server_time, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+    beijing_time = dt.astimezone(BEIJING_TZ)
+    timestamp_ms = int(dt.timestamp() * 1000)
+    print(f"服务器时间(GMT): {dt:%Y-%m-%d %H:%M:%S}")
+    print(f"北京时间: {beijing_time:%Y-%m-%d %H:%M:%S}")
+    print(f"时间戳(毫秒): {timestamp_ms}")
+    return timestamp_ms
+
+def parse_seckill_sessions(html, activity_id=ACTIVITY_ID, target_act_id=SERVER_ACT_ID):
+    """
+    从活动页 HTML 解析目标商品的秒杀场次。
+
+    返回按开始时间升序的列表：[{start_ms, end_ms, start_text}, ...]
+    页面每个场次块都带 activity_id 与绝对毫秒 startTime，
+    因此结果与时区无关，无需人工换算。
+    """
+    marker = f'"activity_id":{activity_id},"channel_tag"'
+    blocks = html.split(marker)[1:]
+    pattern = re.compile(
+        r'"start_date":"(\d{4}-\d{2}-\d{2})","start_time":"(\d{2}:\d{2}:\d{2})"'
+        r',"status":(\d+),"startTime":(\d{13}),"endTime":(\d{13})'
+    )
+    sessions = []
+    for block in blocks:
+        match = pattern.search(block)
+        if not match:
+            continue
+        # 只保留包含目标商品的场次，避免误抢其它品类
+        if str(target_act_id) not in block:
+            continue
+        start_ms = int(match.group(4))
+        sessions.append(
+            {
+                "start_ms": start_ms,
+                "end_ms": int(match.group(5)),
+                "start_text": f"{match.group(1)} {match.group(2)}",
+            }
+        )
+    return sorted(sessions, key=lambda item: item["start_ms"])
+
+
+def fetch_seckill_sessions(timeout=20):
+    """拉取活动页并解析场次；失败返回空列表"""
+    try:
+        resp = requests.get(
+            ACTIVITY_PAGE_URL,
+            headers={"User-Agent": headers["User-Agent"]},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return parse_seckill_sessions(resp.text)
+    except Exception as e:
+        print(f"❌ 场次解析失败：{e}")
+        return []
+
+
+def pick_next_session(sessions, now_ms):
+    """
+    返回第一个尚未结束的场次。
+
+    包含两种情况：正在进行中的场次（主循环会立刻触发抢购），
+    以及下一个还没开始的场次。全部已结束则返回 None。
+    """
+    for session_item in sessions:
+        if session_item["end_ms"] > now_ms:
+            return session_item
+    return None
+
 
 def buy_now_concurrent(region_ids):
     """并发抢购多个地域"""
     with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(buy_now, rid) for rid in region_ids]
-        for future in futures:
+        future_map = {executor.submit(buy_now, rid): rid for rid in region_ids}
+        for future in future_map:
+            rid = future_map[future]
             result = future.result()
+            # 接口异常时 buy_now 返回 None，此处必须先判空，否则整个重试循环会崩溃
             if isinstance(result, dict) and result.get("code") == 0:
-                print(f"🎉 抢购成功！地域ID: {result.get('region_id', '未知')}")
+                print(f"🎉 抢购成功！地域: {REGION_NAMES.get(rid, rid)}")
                 return result
-            # 也可以打印失败信息，方便调试
+            region_label = REGION_NAMES.get(rid, rid)
+            if result is None:
+                print(f"地域 {region_label} 抢购失败: 无响应（网络或接口异常）")
             else:
-                print(f"地域 {result.get('region_id', '未知')} 抢购失败: {result}")
+                print(f"地域 {region_label} 抢购失败: {result}")
     return None
 
 # =================== 主程序 =================== #
@@ -242,18 +323,75 @@ def buy_now_with_retry(
         sleep_func(min(interval_seconds, remaining_seconds))
 
 
+def select_seckill_timestamp(manual_time_str="", now_ms=None):
+    """
+    决定本次抢购的绝对毫秒时间戳。
+
+    manual_time_str 非空时按北京时间手工指定；
+    否则从活动页自动解析当前进行中或下一个未结束的场次。
+    无法确定时返回 None。
+    """
+    if manual_time_str:
+        dt = datetime.strptime(manual_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BEIJING_TZ)
+        return int(dt.timestamp() * 1000)
+
+    sessions = fetch_seckill_sessions()
+    if not sessions:
+        print("❌ 未能从活动页解析到秒杀场次，可设置 SECKILL_TIME_STR 手工指定")
+        return None
+
+    # 用服务器时间选场次：本机时钟偏差过大时，本地时间可能误判当前场次已经结束
+    if now_ms is None:
+        now_ms = get_server_time()
+    if now_ms is None:
+        now_ms = time.time() * 1000
+
+    # 选「尚未结束」的场次：若当前场次仍在进行中则立即开抢，否则等到下一场
+    target = pick_next_session(sessions, now_ms)
+    if target is None:
+        print("❌ 当前没有未开始的场次，最近场次为：")
+        for item in sessions:
+            print(f"   {item['start_text']} -> {item['start_ms']}")
+        return None
+
+    print(f"📅 自动选中场次：{target['start_text']}（北京时间）")
+    return target["start_ms"]
+
+
 if __name__ == "__main__":
     print("🚀 启动腾讯云抢购脚本...")
-    SECKILL_TIME_STR = "2026-08-04 15:00:00" # 秒杀开始时间（北京时间）可以更改为10:00:00,此处需要更改为实际的秒杀时间
-    SECKILL_TIMESTAMP = int(time.mktime(time.strptime(SECKILL_TIME_STR, "%Y-%m-%d %H:%M:%S"))) * 1000
+
+    # 留空则自动从活动页解析下一个场次；需要强制指定时填 "YYYY-MM-DD HH:MM:SS"（北京时间）
+    SECKILL_TIME_STR = ""
+    # 提前触发的毫秒数，避免本机与服务器时钟差异导致请求偏晚
+    EARLY_TRIGGER_MS = 3_000
+
+    if not install_cookies():
+        print("❌ 未找到 cookies.json，请先运行：python get_cookies.py")
+        raise SystemExit(1)
+    refresh_csrf_headers()
+
     region_ids = [1, 4, 8]
-    
-    
+
+    seckill_timestamp = select_seckill_timestamp(SECKILL_TIME_STR)
+    if seckill_timestamp is None:
+        raise SystemExit(1)
+
+    print(f"目标开抢时间戳(毫秒): {seckill_timestamp}")
+    print(f"北京时间: {datetime.fromtimestamp(seckill_timestamp / 1000, BEIJING_TZ):%Y-%m-%d %H:%M:%S}")
+
     while True:
         current_time = get_server_time()
-        if current_time >= SECKILL_TIMESTAMP - 3_000:
+        if current_time is None:
+            # 取不到服务器时间时不能直接比较，退避后重试
+            time.sleep(1)
+            continue
+        if current_time >= seckill_timestamp - EARLY_TRIGGER_MS:
             print("秒杀开始！")
             buy_now_with_retry(region_ids, duration_seconds=60, interval_seconds=0.5)
             break
         else:
-            print(f"⏳ 当前时间未到达秒杀时间，当前服务器时间: {current_time}, 秒杀时间: {SECKILL_TIMESTAMP}")
+            remaining_seconds = (seckill_timestamp - current_time) / 1000
+            print(f"⏳ 等待开抢，剩余 {remaining_seconds:.0f} 秒")
+            # 距开抢较远时降低轮询频率，避免无意义地刷接口
+            time.sleep(10 if remaining_seconds > 60 else 1)
