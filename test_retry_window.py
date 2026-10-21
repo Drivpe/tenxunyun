@@ -108,6 +108,46 @@ class SeckillSessionTest(unittest.TestCase):
             snap_up_server.fetch_seckill_sessions = original
 
 
+class ResolveNowTest(unittest.TestCase):
+    """对时失败不得静默误报"没有场次"，必须退回本地时间"""
+
+    def setUp(self):
+        self._original = snap_up_server.get_server_time
+
+    def tearDown(self):
+        snap_up_server.get_server_time = self._original
+
+    def test_uses_server_time_when_available(self):
+        snap_up_server.get_server_time = lambda: 1792566000000
+        self.assertEqual(snap_up_server.resolve_now_ms(), (1792566000000, False))
+
+    def test_falls_back_to_local_time_and_flags_it(self):
+        snap_up_server.get_server_time = lambda: None
+        now_ms, used_local = snap_up_server.resolve_now_ms()
+        self.assertTrue(used_local)
+        self.assertGreater(now_ms, 0)
+
+    def test_explicit_now_ms_skips_network(self):
+        snap_up_server.get_server_time = lambda: self.fail("不应再请求服务器时间")
+        self.assertEqual(snap_up_server.resolve_now_ms(1234), (1234, False))
+
+    def test_check_branch_still_picks_session_when_time_sync_fails(self):
+        # 修复前：now_ms 为 None 时直接判"没有未结束的场次"
+        import time as _time
+        original_time = snap_up_server.get_server_time
+        now = int(_time.time() * 1000)
+        sessions = [{"start_ms": now - 60_000, "end_ms": now + 3_600_000, "start_text": "进行中"}]
+        snap_up_server.get_server_time = lambda: None
+        try:
+            now_ms, used_local = snap_up_server.resolve_now_ms()
+            target = snap_up_server.pick_next_session(sessions, now_ms)
+        finally:
+            snap_up_server.get_server_time = original_time
+        # 本机时间早于该场次结束时间，必须能选出场次而不是报无场次
+        self.assertTrue(used_local)
+        self.assertIsNotNone(target)
+
+
 class CsrfTokenTest(unittest.TestCase):
     def setUp(self):
         self._saved_cookies = snap_up_server.cookies
@@ -351,6 +391,155 @@ class PrepareEligibilityTest(unittest.TestCase):
         self.assertEqual(snap_up_server.prepare_eligibility_check(), "unknown")
 
 
+class LoginExpiredTest(unittest.TestCase):
+    """登录态中途失效：必须单独给出可操作结论，而不是笼统的资格未通过"""
+
+    def setUp(self):
+        self._original = snap_up_server.session
+
+    def tearDown(self):
+        snap_up_server.session = self._original
+
+    def _prepare(self, code, msg="登录态失效"):
+        class Resp:
+            def json(self):
+                return {"code": code, "msg": msg}
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        return snap_up_server.prepare_eligibility_check()
+
+    def test_not_logined_is_login_expired(self):
+        self.assertEqual(self._prepare("NOT-LOGINED"), "login_expired")
+
+    def test_csrf_error_is_login_expired(self):
+        self.assertEqual(self._prepare("CSRF-ERROR"), "login_expired")
+
+    def test_login_expired_codes_are_fatal_for_buy(self):
+        # 下单接口同样返回这两个码：重试不会恢复会话，必须归入 fatal 立刻停手
+        self.assertEqual(snap_up_server.classify_result({"code": "NOT-LOGINED"}), "fatal")
+        self.assertEqual(snap_up_server.classify_result({"code": "CSRF-ERROR"}), "fatal")
+
+    def test_fatal_codes_derive_from_login_expired_codes(self):
+        # 同一组字符串只能定义一次，避免 fatal 与 login_expired 语义分叉
+        self.assertTrue(
+            snap_up_server.LOGIN_EXPIRED_CODES <= snap_up_server.FATAL_CODES
+        )
+
+
+class StockCheckErrorTest(unittest.TestCase):
+    """None 只能表示"确实无货"；查询失败必须抛异常，否则看守会静默空转"""
+
+    def setUp(self):
+        self._original = snap_up_server.session
+
+    def tearDown(self):
+        snap_up_server.session = self._original
+
+    def test_raises_when_post_fails(self):
+        class FakeSession:
+            def post(self, *a, **k):
+                raise RuntimeError("connection reset")
+
+        snap_up_server.session = FakeSession()
+        with self.assertRaises(snap_up_server.StockCheckError) as ctx:
+            snap_up_server.check_available()
+        self.assertIn("connection reset", str(ctx.exception))
+
+    def test_raises_on_non_zero_code(self):
+        class Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"code": 408, "msg": "系统访问频率过快"}
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        with self.assertRaises(snap_up_server.StockCheckError) as ctx:
+            snap_up_server.check_available()
+        self.assertIn("408", str(ctx.exception))
+
+    def test_no_stock_still_returns_none(self):
+        # 语义不变：权限/库存维度的"没有"是正常结论，不是查询失败
+        class Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"code": 0, "msg": "ok",
+                        "data": [{"available": 1, "user_available": 1, "quota": {}}]}
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        self.assertIsNone(snap_up_server.check_available(quiet=True))
+
+    def test_quiet_silences_failure_paths(self):
+        from unittest.mock import patch
+
+        class Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"code": 500, "msg": "busy"}
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        with patch("builtins.print") as fake_print:
+            with self.assertRaises(snap_up_server.StockCheckError):
+                snap_up_server.check_available(quiet=True)
+        fake_print.assert_not_called()
+
+    def test_quiet_keeps_success_signal(self):
+        # quiet 只静默失败路径：命中库存是重要信号，必须照常打印
+        from unittest.mock import patch
+
+        class Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"code": 0, "msg": "ok",
+                        "data": [{"available": 1, "user_available": 1,
+                                  "quota": {"4": {snap_up_server.SERVER_TYPE: {"available": 2}}}}]}
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        with patch("builtins.print") as fake_print:
+            self.assertEqual(snap_up_server.check_available(quiet=True), 4)
+        printed = " ".join(str(call.args[0]) for call in fake_print.call_args_list if call.args)
+        self.assertIn("有库存", printed)
+
+    def test_non_quiet_still_reports_failure(self):
+        from unittest.mock import patch
+
+        class FakeSession:
+            def post(self, *a, **k):
+                raise RuntimeError("timeout")
+
+        snap_up_server.session = FakeSession()
+        with patch("builtins.print") as fake_print:
+            with self.assertRaises(snap_up_server.StockCheckError):
+                snap_up_server.check_available()
+        fake_print.assert_called_once()
+
+
 class WatchStockTest(unittest.TestCase):
     """回流看守：用只读接口轮询，见货才下单，不硬撞购买接口"""
 
@@ -422,6 +611,97 @@ class WatchStockTest(unittest.TestCase):
             check_func=lambda: None, buy_func=lambda ids: None,
             sleep_func=lambda sec: None,
         ))
+
+    def test_query_error_does_not_crash_watch(self):
+        # 修复前：check_available 失败返回 None，看守当成无货静默空转
+        clock = [1000.0]
+        calls = []
+
+        def fake_check():
+            calls.append(1)
+            if len(calls) < 3:
+                raise snap_up_server.StockCheckError("connection reset")
+            return 4
+
+        bought = []
+
+        def fake_buy(region_ids):
+            bought.append(list(region_ids))
+            return {"code": 0}
+
+        result = snap_up_server.watch_stock_and_buy(
+            [1, 4, 8],
+            end_ms=10_000.0,
+            poll_seconds=1.0,
+            check_func=fake_check,
+            buy_func=fake_buy,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: clock.__setitem__(0, clock[0] + sec),
+        )
+
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(bought, [[4]], "异常恢复后仍应照常下单")
+        self.assertEqual(len(calls), 3)
+
+    def test_repeated_query_errors_warn_about_idle_watch(self):
+        from unittest.mock import patch
+
+        clock = [1000.0]
+
+        def always_fail():
+            raise snap_up_server.StockCheckError("HTTP 429 限流")
+
+        with patch("builtins.print") as fake_print:
+            result = snap_up_server.watch_stock_and_buy(
+                [1, 4, 8],
+                end_ms=None,
+                max_attempts=5,
+                poll_seconds=1.0,
+                check_func=always_fail,
+                buy_func=lambda ids: None,
+                time_func=lambda: clock[0],
+                sleep_func=lambda sec: clock.__setitem__(0, clock[0] + sec),
+            )
+
+        self.assertIsNone(result)
+        printed = " ".join(str(call.args[0]) for call in fake_print.call_args_list if call.args)
+        self.assertIn("库存查询异常", printed)
+        self.assertIn("连续失败 5 次", printed, "连续失败达阈值必须明确告警，不能静默空转")
+        self.assertIn("登录态失效", printed)
+
+    def test_query_fail_streak_resets_after_success(self):
+        from unittest.mock import patch
+
+        clock = [1000.0]
+        outcomes = [
+            snap_up_server.StockCheckError("限流"),
+            None,                      # 成功一次（无货），计数应归零
+            snap_up_server.StockCheckError("限流"),
+            None,
+            snap_up_server.StockCheckError("限流"),
+            None,
+        ]
+
+        def fake_check():
+            item = outcomes.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        with patch("builtins.print") as fake_print:
+            snap_up_server.watch_stock_and_buy(
+                [1, 4, 8],
+                end_ms=None,
+                max_attempts=6,
+                poll_seconds=1.0,
+                check_func=fake_check,
+                buy_func=lambda ids: None,
+                time_func=lambda: clock[0],
+                sleep_func=lambda sec: clock.__setitem__(0, clock[0] + sec),
+            )
+
+        printed = " ".join(str(call.args[0]) for call in fake_print.call_args_list if call.args)
+        self.assertNotIn("连续失败", printed, "中间成功过就不该累计成连续失败")
 
 
 class BuyNowConcurrentTest(unittest.TestCase):

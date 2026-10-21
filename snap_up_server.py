@@ -99,11 +99,25 @@ def refresh_csrf_headers():
 
 # =================== 检查是否可抢购 =================== #
 
+class StockCheckError(Exception):
+    """库存查询本身失败（网络异常 / 接口返回 code != 0）。
+
+    与"确实无货"严格区分：check_available 返回 None 才表示无货，
+    抛本异常表示这次查询没有结论。看守据此告警，而不是把限流或
+    登录失效当成无货静默空转到场次结束。
+    """
+
+
 def check_available(quiet=False):
     """
     检查库存，返回有货的地域ID（无货返回None）
 
-    quiet=True 供回流看守使用：常态无货不打印，避免长时间轮询刷屏。
+    quiet=True 供回流看守使用：除命中库存的 ✅ 提示外，所有打印全部静默，
+    避免长时间轮询刷屏；告警由调用方按自己的节奏输出。
+
+    查询本身失败（接口异常，或返回 code != 0 / msg != "ok"）时抛
+    StockCheckError，并把原始原因带进异常消息；"无权限/无货/所有地域
+    无货"仍返回 None。
     """
     try:
         resp = session.post(
@@ -115,13 +129,17 @@ def check_available(quiet=False):
         resp.raise_for_status()  # 抛出HTTP错误（4xx/5xx）
         result = resp.json()
     except Exception as e:
-        print(f"❌ 库存检查接口调用失败：{str(e)}")
-        return None
+        if not quiet:
+            print(f"❌ 库存检查接口调用失败：{e}")
+        # quiet 模式下由看守统一控制告警节奏，这里不打印
+        raise StockCheckError(f"库存检查接口调用失败：{e}") from e
 
     # 校验接口返回是否正常
     if result.get("code") != 0 or result.get("msg") != "ok":
-        print(f"❌ 库存检查接口返回异常：{json.dumps(result, ensure_ascii=False)}")
-        return None
+        detail = json.dumps(result, ensure_ascii=False)
+        if not quiet:
+            print(f"❌ 库存检查接口返回异常：{detail}")
+        raise StockCheckError(f"库存检查接口返回异常：{detail}")
 
     # 校验商品基础权限（修复：逻辑反转）
     goods_data = result.get("data", [{}])[0]
@@ -203,9 +221,17 @@ def buy_now(region_id):
         return None
     
 def get_server_time():
-    """获取服务器时间（绝对毫秒时间戳，与时区无关）"""
-    response = requests.head(ACTIVITY_PAGE_URL, timeout=10)
-    server_time = response.headers.get("Date")
+    """获取服务器时间（绝对毫秒时间戳，与时区无关）
+
+    失败一律返回 None（含网络异常）：调用方都按"对时不可用"降级处理，
+    异常冒泡会直接崩掉主循环和 --check 诊断。
+    """
+    try:
+        response = requests.head(ACTIVITY_PAGE_URL, timeout=10)
+        server_time = response.headers.get("Date")
+    except Exception as e:
+        print(f"⚠️ 获取服务器时间失败：{e}")
+        return None
 
     if not server_time:
         print("未获取到服务器时间")
@@ -253,20 +279,30 @@ def parse_seckill_sessions(html, activity_id=ACTIVITY_ID, target_act_id=SERVER_A
     return sorted(sessions, key=lambda item: item["start_ms"])
 
 
-def fetch_seckill_sessions(timeout=20, retries=3, backoff_seconds=2.0):
+def fetch_seckill_sessions(timeout=10, retries=3, backoff_seconds=2.0, total_budget_seconds=25.0):
     """
     拉取活动页并解析场次；失败返回空列表。
 
     必须重试：该页面在风控或灰度时会返回不含场次内联数据的精简版
     （实测同一 URL 出现过 1.4MB 完整页与仅数十字节 JS 挑战页两种响应），
     单次抓取失败不代表活动改版。
+
+    必须限总时长：网络异常时单次 SSLError 实测就要 15 秒，3 次重试叠加
+    退避会超过 60 秒，把 `--check` 这种诊断命令拖成"卡死"。因此整体
+    预算 total_budget_seconds，超预算立即放弃并如实报告。
     """
+    started = time.monotonic()
     for attempt in range(1, retries + 1):
+        # 剩余预算不足一次请求的最低耗时就不再尝试
+        remaining = total_budget_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            print(f"⚠️ 抓取活动页已超出 {total_budget_seconds:.0f} 秒总预算，停止重试")
+            return []
         try:
             resp = requests.get(
                 ACTIVITY_PAGE_URL,
                 headers={"User-Agent": headers["User-Agent"]},
-                timeout=timeout,
+                timeout=min(timeout, remaining),
             )
             resp.raise_for_status()
             sessions = parse_seckill_sessions(resp.text)
@@ -274,9 +310,11 @@ def fetch_seckill_sessions(timeout=20, retries=3, backoff_seconds=2.0):
                 return sessions
             print(f"⚠️ 第 {attempt} 次抓取未解析到场次（页面 {len(resp.text)} 字节，可能是风控精简页）")
         except Exception as e:
-            print(f"⚠️ 第 {attempt} 次抓取活动页失败：{e}")
+            print(f"⚠️ 第 {attempt} 次抓取活动页失败：{type(e).__name__}")
         if attempt < retries:
-            time.sleep(backoff_seconds * attempt)
+            pause = min(backoff_seconds * attempt, max(0.0, total_budget_seconds - (time.monotonic() - started)))
+            if pause > 0:
+                time.sleep(pause)
     return []
 
 
@@ -306,8 +344,8 @@ def buy_now_concurrent(region_ids):
         for future in future_map:
             rid = future_map[future]
             result = future.result()
-            # 接口异常时 buy_now 返回 None，此处必须先判空，否则整个重试循环会崩溃
-            if isinstance(result, dict) and result.get("code") == 0:
+            # 接口异常时 buy_now 返回 None，classify_result 对非 dict 归为 retryable
+            if classify_result(result) == "success":
                 print(f"🎉 抢购成功！地域: {REGION_NAMES.get(rid, rid)}")
                 return result
             region_label = REGION_NAMES.get(rid, rid)
@@ -327,6 +365,11 @@ def buy_now_concurrent(region_ids):
 # 明确不可重试的业务错误：账号资格不满足，重试毫无意义
 # 1100106 = 活动仅对已激活账号开放；1100507 = 获取用户信息失败
 FATAL_CODES = {1100106, 1100507}
+# 登录态中途失效（Cookie 约 6 小时过期）：重试不会恢复会话，必须停下来重新扫码。
+# 单独定义是为了让资格预检能给出"重新扫码"这种可操作提示，而不是笼统的资格未通过；
+# 它们同样属于不可重试，故并入 FATAL_CODES。
+LOGIN_EXPIRED_CODES = {"NOT-LOGINED", "CSRF-ERROR"}
+FATAL_CODES |= LOGIN_EXPIRED_CODES
 # 限流：继续高频轰炸只会延长封禁，需要退避
 RATE_LIMIT_CODES = {408}
 # 1100136 = 当前商品已售罄。注意：prepare-do 先校验账号资格再看商品，
@@ -351,7 +394,8 @@ def classify_result(result):
 
 def prepare_eligibility_check():
     """
-    调用 prepare-do 预检账号资格，返回 'passed' / 'blocked' / 'sold_out' / 'unknown'。
+    调用 prepare-do 预检账号资格，返回 'passed' / 'blocked' / 'sold_out' /
+    'login_expired' / 'unknown'。
 
     为什么必须单独预检：check-available 的 user_available=1 只表示商品维度
     可用，并不校验账号激活状态；prepare-do 返回的 act_condition 才是账号
@@ -360,6 +404,10 @@ def prepare_eligibility_check():
 
     prepare-do 的校验顺序是先账号资格、后商品状态：返回 1100136（售罄）
     即证明资格已通过，卡点是库存，等待取消回流即可。
+
+    'login_expired' 表示登录态失效（NOT-LOGINED / CSRF-ERROR）：Cookie 过期
+    或会话变化，重试不会恢复，必须重新扫码后再启动；调用方应直接停止，
+    而不是继续等待开抢。
 
     'unknown' 表示接口给出其它原因（例如秒杀尚未开始），不能据此判定资格失败。
     """
@@ -379,6 +427,13 @@ def prepare_eligibility_check():
     if code == 0:
         print("✅ 资格预检通过")
         return "passed"
+
+    # 登录态问题必须硬拦：脚本可能提前数小时启动，Cookie 中途过期后
+    # 若放行等待，到点开抢只会连续失败，白等一场
+    if code in LOGIN_EXPIRED_CODES:
+        print(f"⛔ 登录态失效：code={code} msg={result.get('msg')}")
+        print("   Cookie 已过期或会话变化，请重新运行 get_cookies.py 扫码后再启动本脚本。")
+        return "login_expired"
 
     if code in FATAL_CODES:
         detail = (result.get("data") or {}).get("detail") or {}
@@ -454,6 +509,22 @@ def buy_now_with_retry(
 
 
 
+def resolve_now_ms(now_ms=None):
+    """
+    取当前毫秒时间戳，返回 (now_ms, used_local)。
+
+    优先用服务器时间：本机时钟偏差过大时会误判场次是否已结束。对时失败
+    时退回本机时间，并把 used_local 置 True，让调用方在日志里说明，
+    避免"对时失败"被静默当成"没有场次"。
+    """
+    if now_ms is not None:
+        return now_ms, False
+    server_ms = get_server_time()
+    if server_ms is not None:
+        return server_ms, False
+    return int(time.time() * 1000), True
+
+
 def select_seckill_session(manual_time_str="", now_ms=None):
     """
     决定本次抢购的场次，返回 {start_ms, end_ms, start_text}，无法确定返回 None。
@@ -471,11 +542,9 @@ def select_seckill_session(manual_time_str="", now_ms=None):
         print("❌ 未能从活动页解析到秒杀场次，可设置 SECKILL_TIME_STR 手工指定")
         return None
 
-    # 用服务器时间选场次：本机时钟偏差过大时，本地时间可能误判当前场次已经结束
-    if now_ms is None:
-        now_ms = get_server_time()
-    if now_ms is None:
-        now_ms = time.time() * 1000
+    now_ms, used_local = resolve_now_ms(now_ms)
+    if used_local:
+        print("⚠️ 未能获取服务器时间，已改用本机时间判断场次，结果可能有偏差")
 
     # 选「尚未结束」的场次：若当前场次仍在进行中则立即开抢，否则等到下一场
     target = pick_next_session(sessions, now_ms)
@@ -505,6 +574,7 @@ def watch_stock_and_buy(
     time_func=None,
     sleep_func=time.sleep,
     max_attempts=None,
+    query_fail_threshold=5,
 ):
     """
     售罄回流看守。
@@ -515,6 +585,10 @@ def watch_stock_and_buy(
 
     终止条件以场次 end_ms 为主（例如 15:00 场守到 18:00）；end_ms 为 None
     （手工指定时间）时必须给 max_attempts，否则返回 None 表示无法确定边界。
+
+    查询异常（StockCheckError，例如限流或登录态失效）不终止看守，但会告警：
+    首次失败打印一次原因，连续失败达到 query_fail_threshold 次后明确提示
+    看守可能空转；查询成功一次即重置失败计数。
 
     成功返回成交结果；场次结束、资格硬错误或达到轮询上限返回 None。
     """
@@ -529,6 +603,7 @@ def watch_stock_and_buy(
         return None
 
     attempt = 0
+    fail_streak = 0
     while max_attempts is None or attempt < max_attempts:
         attempt += 1
         now_ms = time_func()
@@ -536,16 +611,31 @@ def watch_stock_and_buy(
             print("⏱️ 本场次已结束，停止回流看守")
             return None
 
-        region_id = check_func()
+        try:
+            region_id = check_func()
+        except StockCheckError as e:
+            # 查询失败不等于无货：不能当成 None 静默轮询，否则限流或
+            # 登录失效时看守会一直空转到场次结束而毫无提示
+            fail_streak += 1
+            if fail_streak == 1:
+                print(f"⚠️ 库存查询异常：{e}（将继续轮询）")
+            elif fail_streak % query_fail_threshold == 0:
+                print(f"🚨 库存查询已连续失败 {fail_streak} 次：可能被限流或登录态失效，"
+                      f"看守可能空转到场次结束，请检查 Cookie 与网络")
+            region_id = None
+        else:
+            # 查询成功一次就重置：连续失败计数只统计"无结论"的次数
+            fail_streak = 0
+
         if region_id is not None:
             print(f"🔥 检测到回流库存（{REGION_NAMES.get(region_id, region_id)}），立即下单")
             result = buy_func([region_id])
-            if isinstance(result, dict) and result.get("code") == 0:
+            if classify_result(result) == "success":
                 return result
             if classify_result(result) == "fatal":
                 print("⛔ 资格校验未通过，停止看守")
                 return None
-        elif attempt % 12 == 1:
+        elif attempt % 12 == 1 and fail_streak == 0:
             print(f"[watch {attempt}] 暂无回流，每 {poll_seconds:.0f} 秒重查")
 
         sleep_func(poll_seconds)
@@ -576,23 +666,36 @@ if __name__ == "__main__":
     if check_only:
         # 诊断模式不做硬阻断：继续输出库存与场次，一条命令看全状态，
         # 资格被拦时仍以退出码 2 给出红色信号
-        check_available()
+        try:
+            check_available()
+        except StockCheckError as e:
+            # 诊断模式只报告，不让异常冒泡打断后面的场次信息
+            print(f"⚠️ 库存查询失败：{e}")
         sessions = fetch_seckill_sessions()
-        now_ms = get_server_time()
-        target = pick_next_session(sessions, now_ms) if now_ms else None
+        now_ms, used_local = resolve_now_ms()
+        if used_local:
+            # 对时失败不能直接判无场次（会误报），退回本地时间并说明
+            print("⚠️ 未能获取服务器时间，已改用本机时间判断场次，结果可能有偏差")
+        target = pick_next_session(sessions, now_ms)
         if target:
             minutes = (target["start_ms"] - now_ms) / 1000 / 60
             state = f"已开始 {abs(minutes):.0f} 分钟" if minutes <= 0 else f"距开抢 {minutes:.0f} 分钟"
             print(f"📅 场次 {target['start_text']}（北京时间），{state}，"
                   f"结束于 {datetime.fromtimestamp(target['end_ms'] / 1000, BEIJING_TZ):%H:%M}")
+        elif not sessions:
+            # 抓不到场次 ≠ 没有场次，必须分开报，否则会被误读成活动已结束
+            print("⚠️ 未能从活动页解析到场次（可能是风控精简页或网络异常），场次状态未知")
         else:
             print("❌ 当前没有未结束的场次")
         print("✅ 预检完成（未调用任何下单接口）")
-        raise SystemExit(2 if eligibility == "blocked" else 0)
+        raise SystemExit(2 if eligibility in ("blocked", "login_expired") else 0)
 
     if eligibility == "blocked":
         print("❌ 已停止：该账号不满足活动资格，重试与换场次都无法绕过。")
         raise SystemExit(2)
+    if eligibility == "login_expired":
+        print("❌ 已停止：现在重新获取 Cookie 后再启动脚本。")
+        raise SystemExit(3)
     if eligibility == "unknown":
         print("ℹ️ 未能确认可抢，将继续按原计划等待开抢。")
 
@@ -615,7 +718,7 @@ if __name__ == "__main__":
         end_text = datetime.fromtimestamp(target["end_ms"] / 1000, BEIJING_TZ).strftime("%H:%M")
         print(f"👀 场次进行中且当前售罄，进入回流看守直到 {end_text}")
         result = watch_stock_and_buy(region_ids, target["end_ms"])
-        if isinstance(result, dict) and result.get("code") == 0:
+        if classify_result(result) == "success":
             print("🎉 回流抢购成功，60 分钟内必须完成支付")
             raise SystemExit(0)
         raise SystemExit(1)
