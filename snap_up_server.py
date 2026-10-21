@@ -99,9 +99,11 @@ def refresh_csrf_headers():
 
 # =================== 检查是否可抢购 =================== #
 
-def check_available():
+def check_available(quiet=False):
     """
     检查库存，返回有货的地域ID（无货返回None）
+
+    quiet=True 供回流看守使用：常态无货不打印，避免长时间轮询刷屏。
     """
     try:
         resp = session.post(
@@ -124,7 +126,8 @@ def check_available():
     # 校验商品基础权限（修复：逻辑反转）
     goods_data = result.get("data", [{}])[0]
     if goods_data.get("available") != 1 or goods_data.get("user_available") != 1:
-        print("❌ 商品无购买权限/整体无货")
+        if not quiet:
+            print("❌ 商品无购买权限/整体无货")
         return None
 
     # 安全获取地域库存（修复：避免KeyError）
@@ -139,7 +142,8 @@ def check_available():
             return region_id
 
     # 所有地域无货
-    print("❌ 所有目标地域均无库存")
+    if not quiet:
+        print("❌ 所有目标地域均无库存")
     return None
 
 
@@ -249,19 +253,31 @@ def parse_seckill_sessions(html, activity_id=ACTIVITY_ID, target_act_id=SERVER_A
     return sorted(sessions, key=lambda item: item["start_ms"])
 
 
-def fetch_seckill_sessions(timeout=20):
-    """拉取活动页并解析场次；失败返回空列表"""
-    try:
-        resp = requests.get(
-            ACTIVITY_PAGE_URL,
-            headers={"User-Agent": headers["User-Agent"]},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        return parse_seckill_sessions(resp.text)
-    except Exception as e:
-        print(f"❌ 场次解析失败：{e}")
-        return []
+def fetch_seckill_sessions(timeout=20, retries=3, backoff_seconds=2.0):
+    """
+    拉取活动页并解析场次；失败返回空列表。
+
+    必须重试：该页面在风控或灰度时会返回不含场次内联数据的精简版
+    （实测同一 URL 出现过 1.4MB 完整页与仅数十字节 JS 挑战页两种响应），
+    单次抓取失败不代表活动改版。
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(
+                ACTIVITY_PAGE_URL,
+                headers={"User-Agent": headers["User-Agent"]},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            sessions = parse_seckill_sessions(resp.text)
+            if sessions:
+                return sessions
+            print(f"⚠️ 第 {attempt} 次抓取未解析到场次（页面 {len(resp.text)} 字节，可能是风控精简页）")
+        except Exception as e:
+            print(f"⚠️ 第 {attempt} 次抓取活动页失败：{e}")
+        if attempt < retries:
+            time.sleep(backoff_seconds * attempt)
+    return []
 
 
 def pick_next_session(sessions, now_ms):
@@ -277,8 +293,14 @@ def pick_next_session(sessions, now_ms):
     return None
 
 
+# 失败结果的优先级：fatal 必须让主循环立即停手；其次 sold_out（温和节奏）；
+# 再次限流；最后才是其它可重试错误
+_FAILURE_PRIORITY = {"fatal": 0, "sold_out": 1, "rate_limited": 2, "retryable": 3}
+
+
 def buy_now_concurrent(region_ids):
-    """并发抢购多个地域"""
+    """并发抢购多个地域；成功返回成交结果，全部失败返回最具信息量的失败结果"""
+    failures = []
     with ThreadPoolExecutor(max_workers=3) as executor:
         future_map = {executor.submit(buy_now, rid): rid for rid in region_ids}
         for future in future_map:
@@ -293,7 +315,12 @@ def buy_now_concurrent(region_ids):
                 print(f"地域 {region_label} 抢购失败: 无响应（网络或接口异常）")
             else:
                 print(f"地域 {region_label} 抢购失败: {result}")
-    return None
+                failures.append(result)
+    if not failures:
+        return None
+    # 按分类优先级返回，让 buy_now_with_retry 能识别 fatal / sold_out 并区别处理
+    failures.sort(key=lambda item: _FAILURE_PRIORITY.get(classify_result(item), 9))
+    return failures[0]
 
 # =================== 主程序 =================== #
 
@@ -302,10 +329,13 @@ def buy_now_concurrent(region_ids):
 FATAL_CODES = {1100106, 1100507}
 # 限流：继续高频轰炸只会延长封禁，需要退避
 RATE_LIMIT_CODES = {408}
+# 1100136 = 当前商品已售罄。注意：prepare-do 先校验账号资格再看商品，
+# 返回该码说明账号资格已通过，卡点是库存而非资格，等待取消回流即可再试
+SOLD_OUT_CODE = 1100136
 
 
 def classify_result(result):
-    """把接口返回归类：success / rate_limited / fatal / retryable"""
+    """把接口返回归类：success / rate_limited / fatal / sold_out / retryable"""
     if isinstance(result, dict):
         code = result.get("code")
         if code == 0:
@@ -314,17 +344,22 @@ def classify_result(result):
             return "rate_limited"
         if code in FATAL_CODES:
             return "fatal"
+        if code == SOLD_OUT_CODE:
+            return "sold_out"
     return "retryable"
 
 
 def prepare_eligibility_check():
     """
-    调用 prepare-do 预检账号资格，返回 'passed' / 'blocked' / 'unknown'。
+    调用 prepare-do 预检账号资格，返回 'passed' / 'blocked' / 'sold_out' / 'unknown'。
 
     为什么必须单独预检：check-available 的 user_available=1 只表示商品维度
     可用，并不校验账号激活状态；prepare-do 返回的 act_condition 才是账号
     真实状态。实测存在 user_available=1 却被 do-goods 以 1100507 拒绝的账号，
     没有这一步，只会在开抢瞬间才发现抢不到。
+
+    prepare-do 的校验顺序是先账号资格、后商品状态：返回 1100136（售罄）
+    即证明资格已通过，卡点是库存，等待取消回流即可。
 
     'unknown' 表示接口给出其它原因（例如秒杀尚未开始），不能据此判定资格失败。
     """
@@ -357,6 +392,11 @@ def prepare_eligibility_check():
             print("   否则本场及后续场次都会被 do-goods 直接拒绝。")
         return "blocked"
 
+    if code == SOLD_OUT_CODE:
+        print("✅ 账号资格已通过（能走到售罄判断就说明资格没问题）")
+        print("ℹ️ 当前商品已售罄（1100136），卡点是库存，不是资格。")
+        return "sold_out"
+
     print(f"ℹ️ 资格预检返回其它状态：code={code} msg={result.get('msg')}")
     return "unknown"
 
@@ -369,6 +409,7 @@ def buy_now_with_retry(
     time_func=time.monotonic,
     sleep_func=time.sleep,
     max_backoff_seconds=8.0,
+    sold_out_interval_seconds=3.0,
 ):
     deadline = time_func() + duration_seconds
     attempt = 0
@@ -399,6 +440,11 @@ def buy_now_with_retry(
             wait_seconds = min(max(backoff * 2, 1.0), max_backoff_seconds)
             backoff = wait_seconds
             print(f"⚠️ 触发限流(408)，退避 {wait_seconds:.1f} 秒")
+        elif kind == "sold_out":
+            # 已售罄：保持温和节奏轮询等待取消回流；高频硬撞只会换来 408
+            backoff = interval_seconds
+            wait_seconds = sold_out_interval_seconds
+            print(f"ℹ️ 已售罄，每 {wait_seconds:.1f} 秒温和重试等待回流")
         else:
             # 正常可重试（如秒杀尚未开始）：恢复基准节奏
             backoff = interval_seconds
@@ -408,17 +454,17 @@ def buy_now_with_retry(
 
 
 
-def select_seckill_timestamp(manual_time_str="", now_ms=None):
+def select_seckill_session(manual_time_str="", now_ms=None):
     """
-    决定本次抢购的绝对毫秒时间戳。
+    决定本次抢购的场次，返回 {start_ms, end_ms, start_text}，无法确定返回 None。
 
-    manual_time_str 非空时按北京时间手工指定；
+    manual_time_str 非空时按北京时间手工指定（无 end_ms，为 None）；
     否则从活动页自动解析当前进行中或下一个未结束的场次。
-    无法确定时返回 None。
     """
     if manual_time_str:
         dt = datetime.strptime(manual_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BEIJING_TZ)
-        return int(dt.timestamp() * 1000)
+        start_ms = int(dt.timestamp() * 1000)
+        return {"start_ms": start_ms, "end_ms": None, "start_text": manual_time_str, "now_ms": None}
 
     sessions = fetch_seckill_sessions()
     if not sessions:
@@ -434,13 +480,78 @@ def select_seckill_timestamp(manual_time_str="", now_ms=None):
     # 选「尚未结束」的场次：若当前场次仍在进行中则立即开抢，否则等到下一场
     target = pick_next_session(sessions, now_ms)
     if target is None:
-        print("❌ 当前没有未开始的场次，最近场次为：")
+        print("❌ 当前没有未结束的场次，最近场次为：")
         for item in sessions:
             print(f"   {item['start_text']} -> {item['start_ms']}")
         return None
 
     print(f"📅 自动选中场次：{target['start_text']}（北京时间）")
-    return target["start_ms"]
+    # 携带对时结果，主流程不再重复请求服务器时间
+    return {**target, "now_ms": now_ms}
+
+
+def select_seckill_timestamp(manual_time_str="", now_ms=None):
+    """兼容入口：只取开抢毫秒时间戳"""
+    target = select_seckill_session(manual_time_str, now_ms)
+    return target["start_ms"] if target else None
+
+
+def watch_stock_and_buy(
+    region_ids,
+    end_ms,
+    poll_seconds=5.0,
+    check_func=None,
+    buy_func=buy_now_concurrent,
+    time_func=None,
+    sleep_func=time.sleep,
+    max_attempts=None,
+):
+    """
+    售罄回流看守。
+
+    为什么用只读轮询而不是持续打 do-goods：实测 0.5 秒硬撞购买接口触发 408，
+    而 check-available 连续请求仍正常返回 code=0。取消单回流的配额由
+    check-available 侦测到后再定点下单，既不撞风控，又能守到场次结束。
+
+    终止条件以场次 end_ms 为主（例如 15:00 场守到 18:00）；end_ms 为 None
+    （手工指定时间）时必须给 max_attempts，否则返回 None 表示无法确定边界。
+
+    成功返回成交结果；场次结束、资格硬错误或达到轮询上限返回 None。
+    """
+    if time_func is None:
+        time_func = lambda: time.time() * 1000
+    if check_func is None:
+        # 静默轮询：无货是常态，刷屏到 18:00 会有上千行
+        check_func = lambda: check_available(quiet=True)
+
+    if end_ms is None and max_attempts is None:
+        print("⚠️ 手工时间无法确定场次边界，请指定 max_attempts 后使用看守模式")
+        return None
+
+    attempt = 0
+    while max_attempts is None or attempt < max_attempts:
+        attempt += 1
+        now_ms = time_func()
+        if end_ms is not None and now_ms >= end_ms:
+            print("⏱️ 本场次已结束，停止回流看守")
+            return None
+
+        region_id = check_func()
+        if region_id is not None:
+            print(f"🔥 检测到回流库存（{REGION_NAMES.get(region_id, region_id)}），立即下单")
+            result = buy_func([region_id])
+            if isinstance(result, dict) and result.get("code") == 0:
+                return result
+            if classify_result(result) == "fatal":
+                print("⛔ 资格校验未通过，停止看守")
+                return None
+        elif attempt % 12 == 1:
+            print(f"[watch {attempt}] 暂无回流，每 {poll_seconds:.0f} 秒重查")
+
+        sleep_func(poll_seconds)
+
+    print("⏱️ 达到回流轮询上限，停止看守")
+    return None
 
 
 if __name__ == "__main__":
@@ -485,12 +596,29 @@ if __name__ == "__main__":
     if eligibility == "unknown":
         print("ℹ️ 未能确认可抢，将继续按原计划等待开抢。")
 
-    seckill_timestamp = select_seckill_timestamp(SECKILL_TIME_STR)
-    if seckill_timestamp is None:
+    target = select_seckill_session(SECKILL_TIME_STR)
+    if target is None:
         raise SystemExit(1)
 
-    print(f"目标开抢时间戳(毫秒): {seckill_timestamp}")
-    print(f"北京时间: {datetime.fromtimestamp(seckill_timestamp / 1000, BEIJING_TZ):%Y-%m-%d %H:%M:%S}")
+    start_dt = datetime.fromtimestamp(target["start_ms"] / 1000, BEIJING_TZ)
+    now_ms = target["now_ms"] or get_server_time() or int(time.time() * 1000)
+    if target["end_ms"] is not None:
+        end_dt = datetime.fromtimestamp(target["end_ms"] / 1000, BEIJING_TZ)
+        print(f"当前北京时间: {datetime.fromtimestamp(now_ms / 1000, BEIJING_TZ):%H:%M:%S}，"
+              f"本场窗口 {start_dt:%H:%M}–{end_dt:%H:%M}")
+    else:
+        print(f"目标开抢时间: {start_dt:%Y-%m-%d %H:%M:%S}（北京时间，手工指定）")
+
+    # 资格已通、只是暂时售罄，且场次已在进行中：进入只读回流看守，
+    # 守到场次结束；而不是持续硬撞购买接口换 408 封禁
+    if eligibility == "sold_out" and target["end_ms"] is not None and now_ms >= target["start_ms"]:
+        end_text = datetime.fromtimestamp(target["end_ms"] / 1000, BEIJING_TZ).strftime("%H:%M")
+        print(f"👀 场次进行中且当前售罄，进入回流看守直到 {end_text}")
+        result = watch_stock_and_buy(region_ids, target["end_ms"])
+        if isinstance(result, dict) and result.get("code") == 0:
+            print("🎉 回流抢购成功，60 分钟内必须完成支付")
+            raise SystemExit(0)
+        raise SystemExit(1)
 
     while True:
         current_time = get_server_time()
@@ -498,12 +626,12 @@ if __name__ == "__main__":
             # 取不到服务器时间时不能直接比较，退避后重试
             time.sleep(1)
             continue
-        if current_time >= seckill_timestamp - EARLY_TRIGGER_MS:
+        if current_time >= target["start_ms"] - EARLY_TRIGGER_MS:
             print("秒杀开始！")
             buy_now_with_retry(region_ids, duration_seconds=60, interval_seconds=0.5)
             break
         else:
-            remaining_seconds = (seckill_timestamp - current_time) / 1000
+            remaining_seconds = (target["start_ms"] - current_time) / 1000
             print(f"⏳ 等待开抢，剩余 {remaining_seconds:.0f} 秒")
             # 距开抢较远时降低轮询频率，避免无意义地刷接口
             time.sleep(10 if remaining_seconds > 60 else 1)

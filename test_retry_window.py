@@ -172,6 +172,14 @@ class ResultClassificationTest(unittest.TestCase):
     def test_seckill_not_started_is_retryable(self):
         self.assertEqual(snap_up_server.classify_result({"code": 1101001}), "retryable")
 
+    def test_sold_out_classified_separately(self):
+        # 1100136 是库存问题，不是资格问题：不得归入 fatal 停止，
+        # 也不得按 0.5 秒硬撞（只会换来 408）
+        self.assertEqual(
+            snap_up_server.classify_result({"code": 1100136, "msg": "抱歉，当前商品已售罄"}),
+            "sold_out",
+        )
+
     def test_none_and_unknown_are_retryable(self):
         self.assertEqual(snap_up_server.classify_result(None), "retryable")
         self.assertEqual(snap_up_server.classify_result({"code": 9999}), "retryable")
@@ -226,6 +234,29 @@ class RateLimitBackoffTest(unittest.TestCase):
         self.assertLessEqual(max(slept), 8.0)
         self.assertGreater(slept[1], 0.5, "限流时不得沿用 0.5 秒高频节奏")
 
+    def test_sold_out_waits_gently_instead_of_hard_hitting(self):
+        # 修复前：1100136 归入 retryable，按 0.5 秒硬撞换回 408
+        slept = []
+        clock = [0.0]
+        codes = [{"code": 1100136, "msg": "抱歉，当前商品已售罄"}] * 3 + [{"code": 0}]
+
+        def fake_buy(region_ids):
+            return codes.pop(0)
+
+        result = snap_up_server.buy_now_with_retry(
+            [1, 4, 8],
+            duration_seconds=60,
+            interval_seconds=0.5,
+            sold_out_interval_seconds=3.0,
+            buy_func=fake_buy,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: (slept.append(sec), clock.__setitem__(0, clock[0] + sec)),
+        )
+
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(slept[:3], [3.0, 3.0, 3.0])
+        self.assertTrue(all(sec > 0.5 for sec in slept[:3]))
+
     def test_returns_to_base_interval_after_retryable(self):
         slept = []
         clock = [0.0]
@@ -273,6 +304,20 @@ class PrepareEligibilityTest(unittest.TestCase):
         snap_up_server.session = FakeSession()
         self.assertEqual(snap_up_server.prepare_eligibility_check(), "blocked")
 
+    def test_sold_out_is_not_blocked(self):
+        # 1100136 说明账号资格已通过（prepare-do 先查资格再查商品），
+        # 主流程必须继续而不是退出
+        class Resp:
+            def json(self):
+                return {"code": 1100136, "msg": "抱歉，当前商品已售罄，欢迎选择其他商品"}
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return Resp()
+
+        snap_up_server.session = FakeSession()
+        self.assertEqual(snap_up_server.prepare_eligibility_check(), "sold_out")
+
     def test_passed_on_code_zero(self):
         class Resp:
             def json(self):
@@ -304,6 +349,79 @@ class PrepareEligibilityTest(unittest.TestCase):
 
         snap_up_server.session = FakeSession()
         self.assertEqual(snap_up_server.prepare_eligibility_check(), "unknown")
+
+
+class WatchStockTest(unittest.TestCase):
+    """回流看守：用只读接口轮询，见货才下单，不硬撞购买接口"""
+
+    def test_buys_when_stock_reappears(self):
+        clock = [1000.0]
+        checks = iter([None, None, 4])
+        bought = []
+
+        def fake_check():
+            return next(checks)
+
+        def fake_buy(region_ids):
+            bought.append(list(region_ids))
+            return {"code": 0}
+
+        result = snap_up_server.watch_stock_and_buy(
+            [1, 4, 8],
+            end_ms=10_000.0,
+            poll_seconds=5.0,
+            check_func=fake_check,
+            buy_func=fake_buy,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: clock.__setitem__(0, clock[0] + sec),
+        )
+
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(bought, [[4]], "应只对检测到库存的地域下单")
+
+    def test_stops_when_session_ended(self):
+        clock = [1000.0]
+        calls = []
+
+        def fake_check():
+            calls.append(1)
+            return None
+
+        result = snap_up_server.watch_stock_and_buy(
+            [1, 4, 8],
+            end_ms=3000.0,
+            poll_seconds=1000.0,
+            check_func=fake_check,
+            buy_func=lambda ids: None,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: clock.__setitem__(0, clock[0] + sec),
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 2, "到期前查两次，到期后必须停")
+
+    def test_fatal_during_watch_stops_watch(self):
+        clock = [1000.0]
+
+        result = snap_up_server.watch_stock_and_buy(
+            [1, 4, 8],
+            end_ms=None,
+            max_attempts=5,
+            check_func=lambda: 4,
+            buy_func=lambda ids: {"code": 1100507},
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: clock.__setitem__(0, clock[0] + sec),
+        )
+
+        self.assertIsNone(result)
+
+    def test_manual_time_without_cap_is_refused(self):
+        # 手工指定时间没有场次边界，必须拒绝无限轮询
+        self.assertIsNone(snap_up_server.watch_stock_and_buy(
+            [1, 4, 8], end_ms=None, max_attempts=None,
+            check_func=lambda: None, buy_func=lambda ids: None,
+            sleep_func=lambda sec: None,
+        ))
 
 
 class BuyNowConcurrentTest(unittest.TestCase):
