@@ -220,17 +220,21 @@ def buy_now(region_id):
         print(f"❌ 核心购买接口调用失败：{str(e)}")
         return None
     
-def get_server_time():
+def get_server_time(timeout=2):
     """获取服务器时间（绝对毫秒时间戳，与时区无关）
 
     失败一律返回 None（含网络异常）：调用方都按"对时不可用"降级处理，
     异常冒泡会直接崩掉主循环和 --check 诊断。
+
+    timeout 必须小：该函数在主等待循环里被反复调用，实测 10 秒超时会在
+    网络抖动时把开抢点整体拖后 8 秒（2026-10-22 10:00 场实测），
+    秒杀场景下这等于直接放弃。
     """
     try:
-        response = requests.head(ACTIVITY_PAGE_URL, timeout=10)
+        response = requests.head(ACTIVITY_PAGE_URL, timeout=timeout)
         server_time = response.headers.get("Date")
     except Exception as e:
-        print(f"⚠️ 获取服务器时间失败：{e}")
+        print(f"⚠️ 获取服务器时间失败：{type(e).__name__}")
         return None
 
     if not server_time:
@@ -336,24 +340,53 @@ def pick_next_session(sessions, now_ms):
 _FAILURE_PRIORITY = {"fatal": 0, "sold_out": 1, "rate_limited": 2, "retryable": 3}
 
 
-def buy_now_concurrent(region_ids):
-    """并发抢购多个地域；成功返回成交结果，全部失败返回最具信息量的失败结果"""
+def buy_now_concurrent(region_ids, serial=False):
+    """抢购多个地域；成功返回成交结果，全部失败返回最具信息量的失败结果
+
+    serial=True 时改为串行尝试。实测 2026-10-22 10:00 场：三地域并发会触发
+    `1100110 正在执行其他操作，请稍候再试`——同一账号的并发下单被服务端
+    串行化，三个请求互相把对方顶掉，等于自相残杀。串行虽然单轮耗时更长，
+    但每个请求都能真正进入下单流程。
+    """
     failures = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_map = {executor.submit(buy_now, rid): rid for rid in region_ids}
-        for future in future_map:
-            rid = future_map[future]
-            result = future.result()
-            # 接口异常时 buy_now 返回 None，classify_result 对非 dict 归为 retryable
-            if classify_result(result) == "success":
-                print(f"🎉 抢购成功！地域: {REGION_NAMES.get(rid, rid)}")
-                return result
-            region_label = REGION_NAMES.get(rid, rid)
-            if result is None:
-                print(f"地域 {region_label} 抢购失败: 无响应（网络或接口异常）")
-            else:
-                print(f"地域 {region_label} 抢购失败: {result}")
-                failures.append(result)
+    success = {"hit": False}
+
+    def attempt(rid):
+        result = buy_now(rid)
+        if classify_result(result) == "success":
+            print(f"🎉 抢购成功！地域: {REGION_NAMES.get(rid, rid)}")
+            success["hit"] = True
+            success["result"] = result
+            return True
+        region_label = REGION_NAMES.get(rid, rid)
+        if result is None:
+            print(f"地域 {region_label} 抢购失败: 无响应（网络或接口异常）")
+        else:
+            print(f"地域 {region_label} 抢购失败: {result}")
+            failures.append(result)
+        return False
+
+    if serial:
+        for rid in region_ids:
+            if attempt(rid):
+                return success["result"]
+    else:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_map = {executor.submit(buy_now, rid): rid for rid in region_ids}
+            for future in future_map:
+                rid = future_map[future]
+                result = future.result()
+                # 接口异常时 buy_now 返回 None，classify_result 对非 dict 归为 retryable
+                if classify_result(result) == "success":
+                    print(f"🎉 抢购成功！地域: {REGION_NAMES.get(rid, rid)}")
+                    return result
+                region_label = REGION_NAMES.get(rid, rid)
+                if result is None:
+                    print(f"地域 {region_label} 抢购失败: 无响应（网络或接口异常）")
+                else:
+                    print(f"地域 {region_label} 抢购失败: {result}")
+                    failures.append(result)
+
     if not failures:
         return None
     # 按分类优先级返回，让 buy_now_with_retry 能识别 fatal / sold_out 并区别处理
@@ -460,13 +493,28 @@ def buy_now_with_retry(
     region_ids,
     duration_seconds=60,
     interval_seconds=0.5,
-    buy_func=buy_now_concurrent,
+    buy_func=None,
     time_func=time.monotonic,
     sleep_func=time.sleep,
     max_backoff_seconds=8.0,
     sold_out_interval_seconds=3.0,
+    opening_burst_seconds=15.0,
 ):
+    """
+    重试窗口。
+
+    opening_burst_seconds：开抢瞬间的黄金期。实测 2026-10-22 10:00 场，
+    开抢后前 5 轮全部 408，若按指数退避 1→2→4→8 秒，15 秒内只发出 5 次
+    请求；而这段窗口正是库存可能仍在的唯一时段。因此黄金期内不退避，
+    保持 interval_seconds 节奏硬打，过了黄金期才启用指数退避保护账号。
+
+    buy_func 默认走串行：实测三地域并发会互相触发
+    `1100110 正在执行其他操作`，同账号并发下单被服务端串行化。
+    """
+    if buy_func is None:
+        buy_func = lambda ids: buy_now_concurrent(ids, serial=True)
     deadline = time_func() + duration_seconds
+    burst_deadline = time_func() + opening_burst_seconds
     attempt = 0
     last_result = None
     backoff = interval_seconds
@@ -490,16 +538,24 @@ def buy_now_with_retry(
             print(f"retry window ended after {duration_seconds} seconds")
             return last_result
 
+        in_burst = time_func() < burst_deadline
+
         if kind == "rate_limited":
-            # 408 限流：指数退避，给网关冷却时间
-            wait_seconds = min(max(backoff * 2, 1.0), max_backoff_seconds)
-            backoff = wait_seconds
-            print(f"⚠️ 触发限流(408)，退避 {wait_seconds:.1f} 秒")
+            if in_burst:
+                # 黄金期不退避：408 多半是瞬时拥塞，退避等于把窗口让给别人
+                backoff = interval_seconds
+                wait_seconds = interval_seconds
+                print(f"⚠️ 触发限流(408)，黄金期内不退避，{wait_seconds:.1f} 秒后重试")
+            else:
+                # 过了黄金期：指数退避，给网关冷却时间，避免账号被加重风控
+                wait_seconds = min(max(backoff * 2, 1.0), max_backoff_seconds)
+                backoff = wait_seconds
+                print(f"⚠️ 触发限流(408)，退避 {wait_seconds:.1f} 秒")
         elif kind == "sold_out":
             # 已售罄：保持温和节奏轮询等待取消回流；高频硬撞只会换来 408
             backoff = interval_seconds
-            wait_seconds = sold_out_interval_seconds
-            print(f"ℹ️ 已售罄，每 {wait_seconds:.1f} 秒温和重试等待回流")
+            wait_seconds = interval_seconds if in_burst else sold_out_interval_seconds
+            print(f"ℹ️ 已售罄，{wait_seconds:.1f} 秒后重试")
         else:
             # 正常可重试（如秒杀尚未开始）：恢复基准节奏
             backoff = interval_seconds
@@ -712,9 +768,12 @@ if __name__ == "__main__":
     else:
         print(f"目标开抢时间: {start_dt:%Y-%m-%d %H:%M:%S}（北京时间，手工指定）")
 
-    # 资格已通、只是暂时售罄，且场次已在进行中：进入只读回流看守，
-    # 守到场次结束；而不是持续硬撞购买接口换 408 封禁
-    if eligibility == "sold_out" and target["end_ms"] is not None and now_ms >= target["start_ms"]:
+    # 场次已在进行中且当前售罄：进入只读回流看守，守到场次结束。
+    # 注意必须排除"场次尚未开始"的情况：开抢前配额本就是 0，prepare-do 同样
+    # 返回 1100136，若在这里直接进看守，就会跳过真正的开抢瞬间。
+    if (eligibility == "sold_out"
+            and target["end_ms"] is not None
+            and target["start_ms"] <= now_ms < target["end_ms"]):
         end_text = datetime.fromtimestamp(target["end_ms"] / 1000, BEIJING_TZ).strftime("%H:%M")
         print(f"👀 场次进行中且当前售罄，进入回流看守直到 {end_text}")
         result = watch_stock_and_buy(region_ids, target["end_ms"])
@@ -723,18 +782,70 @@ if __name__ == "__main__":
             raise SystemExit(0)
         raise SystemExit(1)
 
+    if eligibility == "sold_out":
+        # 开抢前售罄是正常状态，必须继续等待到点，不能提前退场
+        print("ℹ️ 当前显示售罄属开抢前正常状态，继续等待开抢")
+
+    # ===== 等待开抢 =====
+    # 关键设计：只在开始等待时对一次时，算出"服务器时间 - 本机单调时钟"的偏移，
+    # 之后全程用本机单调时钟推进。绝不在循环里反复发 HEAD 请求对时——
+    # 2026-10-22 10:00 场实测：两次 ReadTimeout(10s) 把开抢点整体拖后 8 秒，
+    # 等到真正发请求时库存已空。秒杀场景下，等待循环必须与网络解耦。
+    def sync_offset():
+        """返回 (offset_ms, ok)：offset = 服务器时间 - 本机时钟"""
+        local_now_ms = time.time() * 1000
+        server_now_ms = get_server_time(timeout=2)
+        if server_now_ms is None:
+            return None, False
+        return server_now_ms - local_now_ms, True
+
+    offset_ms, synced = sync_offset()
+    if not synced:
+        print("⚠️ 首次对时失败，改用本机时间；请确认本机时钟准确（NTP）")
+        offset_ms = 0
+
+    def server_now():
+        return time.time() * 1000 + offset_ms
+
+    remaining_ms = target["start_ms"] - server_now()
+    print(f"⏳ 距开抢 {remaining_ms / 1000:.1f} 秒（"
+          f"{'已对时' if synced else '本机时间'}，等待期间不再请求网络）")
+
+    # 距开抢还早时，用长时间 sleep 分段推进；最后阶段用精确 sleep
     while True:
-        current_time = get_server_time()
-        if current_time is None:
-            # 取不到服务器时间时不能直接比较，退避后重试
-            time.sleep(1)
-            continue
-        if current_time >= target["start_ms"] - EARLY_TRIGGER_MS:
-            print("秒杀开始！")
-            buy_now_with_retry(region_ids, duration_seconds=60, interval_seconds=0.5)
+        remaining_ms = target["start_ms"] - EARLY_TRIGGER_MS - server_now()
+        if remaining_ms <= 0:
             break
-        else:
-            remaining_seconds = (target["start_ms"] - current_time) / 1000
-            print(f"⏳ 等待开抢，剩余 {remaining_seconds:.0f} 秒")
-            # 距开抢较远时降低轮询频率，避免无意义地刷接口
-            time.sleep(10 if remaining_seconds > 60 else 1)
+        # 距开抢超过 60 秒时，每 10 秒重新对一次时（此时网络抖动无代价），
+        # 进入最后 60 秒后完全依赖已校准的偏移，不再发任何对时请求
+        if remaining_ms > 60_000:
+            time.sleep(min(remaining_ms / 1000 - 50, 10))
+            new_offset, ok = sync_offset()
+            if ok:
+                offset_ms = new_offset
+            continue
+        # 最后 60 秒：单次 sleep 到点，避免循环抖动累积误差
+        time.sleep(max(0.0, remaining_ms / 1000))
+        break
+
+    print("秒杀开始！")
+    result = buy_now_with_retry(region_ids, duration_seconds=60, interval_seconds=0.5)
+    if classify_result(result) == "success":
+        print("🎉 抢购成功，60 分钟内必须完成支付")
+        raise SystemExit(0)
+    if classify_result(result) == "fatal":
+        print("❌ 已停止：账号资格校验未通过，重试与换场次都无法绕过。")
+        raise SystemExit(2)
+
+    # 60 秒窗口内没抢到，不等于这场结束了：秒杀配额常在开抢瞬间清空，
+    # 之后靠别人取消订单回流。原来这里直接 break 会让脚本在开抢 1 分钟
+    # 后就退出，把剩余整个场次窗口（最长近 2 小时）白白丢掉。
+    if target["end_ms"] is not None and server_now() < target["end_ms"]:
+        end_text = datetime.fromtimestamp(target["end_ms"] / 1000, BEIJING_TZ).strftime("%H:%M")
+        print(f"⏳ 60 秒内未抢到，转入回流看守直到 {end_text}")
+        result = watch_stock_and_buy(region_ids, target["end_ms"])
+        if classify_result(result) == "success":
+            print("🎉 回流抢购成功，60 分钟内必须完成支付")
+            raise SystemExit(0)
+        print("❌ 本场次结束，仍未抢到")
+        raise SystemExit(1)

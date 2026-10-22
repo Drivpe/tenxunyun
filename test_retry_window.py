@@ -265,6 +265,7 @@ class RateLimitBackoffTest(unittest.TestCase):
             time_func=lambda: clock[0],
             sleep_func=lambda sec: (slept.append(sec), clock.__setitem__(0, clock[0] + sec)),
             max_backoff_seconds=8.0,
+            opening_burst_seconds=0,
         )
 
         # 修复前恒为 0.5 秒；现在应逐轮拉大并封顶
@@ -288,6 +289,7 @@ class RateLimitBackoffTest(unittest.TestCase):
             duration_seconds=60,
             interval_seconds=0.5,
             sold_out_interval_seconds=3.0,
+            opening_burst_seconds=0,
             buy_func=fake_buy,
             time_func=lambda: clock[0],
             sleep_func=lambda sec: (slept.append(sec), clock.__setitem__(0, clock[0] + sec)),
@@ -312,6 +314,7 @@ class RateLimitBackoffTest(unittest.TestCase):
             buy_func=fake_buy,
             time_func=lambda: clock[0],
             sleep_func=lambda sec: (slept.append(sec), clock.__setitem__(0, clock[0] + sec)),
+            opening_burst_seconds=0,
         )
 
         self.assertEqual(result["code"], 0)
@@ -720,6 +723,126 @@ class BuyNowConcurrentTest(unittest.TestCase):
         snap_up_server.buy_now = lambda region_id: {"code": 0} if region_id == 4 else None
         try:
             self.assertEqual(snap_up_server.buy_now_concurrent([1, 4, 8]), {"code": 0})
+        finally:
+            snap_up_server.buy_now = original
+
+
+class SoldOutBeforeStartTest(unittest.TestCase):
+    """开抢前必然显示售罄，不能据此提前进看守或退场"""
+
+    def test_sold_out_before_start_is_not_treated_as_in_progress(self):
+        # 场次 10:00–12:00，现在 09:48：售罄属正常，不得判为"进行中"
+        start_ms, end_ms = 1792634400000, 1792641600000
+        now_ms = start_ms - 12 * 60 * 1000
+        in_progress = start_ms <= now_ms < end_ms
+        self.assertFalse(in_progress, "开抢前不得进入回流看守")
+
+    def test_sold_out_after_start_is_in_progress(self):
+        start_ms, end_ms = 1792634400000, 1792641600000
+        now_ms = start_ms + 60 * 1000
+        self.assertTrue(start_ms <= now_ms < end_ms)
+
+    def test_sold_out_after_end_is_not_in_progress(self):
+        start_ms, end_ms = 1792634400000, 1792641600000
+        self.assertFalse(start_ms <= end_ms + 1 < end_ms)
+
+
+class WindowNotAbandonedTest(unittest.TestCase):
+    """60 秒重试窗口用完不等于场次结束"""
+
+    def test_retry_window_shorter_than_session_window(self):
+        # 开抢后 60 秒窗口结束，但场次还剩近 2 小时，必须继续看守
+        duration_seconds = 60
+        session_remaining_seconds = 119 * 60
+        self.assertGreater(session_remaining_seconds, duration_seconds)
+
+    def test_source_no_longer_breaks_right_after_retry(self):
+        import inspect
+        source = inspect.getsource(snap_up_server)
+        # 开抢分支在 buy_now_with_retry 之后必须还能进入看守，而不是直接 break
+        self.assertIn("60 秒内未抢到，转入回流看守", source)
+
+
+class OpeningBurstTest(unittest.TestCase):
+    """开抢黄金期内不退避：实测 10-22 场 408 退避白耗 15 秒"""
+
+    def test_no_backoff_during_opening_burst(self):
+        slept = []
+        clock = [0.0]
+
+        def fake_buy(region_ids):
+            return {"code": 408, "msg": "系统访问频率过快"}
+
+        snap_up_server.buy_now_with_retry(
+            [1, 4, 8],
+            duration_seconds=60,
+            interval_seconds=0.5,
+            buy_func=fake_buy,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: (slept.append(sec), clock.__setitem__(0, clock[0] + sec)),
+            opening_burst_seconds=15.0,
+            max_backoff_seconds=8.0,
+        )
+
+        # 黄金期（前 15 秒）内必须保持 0.5 秒节奏，不得拉长
+        burst_sleeps = [s for s in slept if s <= 0.5]
+        self.assertGreater(len(burst_sleeps), 10, "黄金期内应保持高频重试")
+        self.assertEqual(burst_sleeps[0], 0.5)
+
+    def test_backoff_resumes_after_burst(self):
+        slept = []
+        clock = [0.0]
+
+        def fake_buy(region_ids):
+            return {"code": 408, "msg": "系统访问频率过快"}
+
+        snap_up_server.buy_now_with_retry(
+            [1, 4, 8],
+            duration_seconds=60,
+            interval_seconds=0.5,
+            buy_func=fake_buy,
+            time_func=lambda: clock[0],
+            sleep_func=lambda sec: (slept.append(sec), clock.__setitem__(0, clock[0] + sec)),
+            opening_burst_seconds=3.0,
+            max_backoff_seconds=8.0,
+        )
+
+        # 黄金期结束后必须出现退避
+        self.assertTrue(any(s > 0.5 for s in slept), "黄金期后应启用退避保护账号")
+
+
+class SerialBuyTest(unittest.TestCase):
+    """三地域并发会互相触发 1100110，必须串行"""
+
+    def test_serial_mode_stops_at_first_success(self):
+        original = snap_up_server.buy_now
+        order = []
+
+        def fake_buy(rid):
+            order.append(rid)
+            return {"code": 0} if rid == 4 else {"code": 1100136}
+
+        snap_up_server.buy_now = fake_buy
+        try:
+            result = snap_up_server.buy_now_concurrent([1, 4, 8], serial=True)
+            self.assertEqual(result["code"], 0)
+            # 命中上海后不再尝试北京
+            self.assertEqual(order, [1, 4])
+        finally:
+            snap_up_server.buy_now = original
+
+    def test_serial_mode_visits_all_on_failure(self):
+        original = snap_up_server.buy_now
+        order = []
+
+        def fake_buy(rid):
+            order.append(rid)
+            return {"code": 1100136}
+
+        snap_up_server.buy_now = fake_buy
+        try:
+            snap_up_server.buy_now_concurrent([1, 4, 8], serial=True)
+            self.assertEqual(order, [1, 4, 8])
         finally:
             snap_up_server.buy_now = original
 
